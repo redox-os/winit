@@ -5,9 +5,9 @@ use std::{
     marker::PhantomData,
     sync::{Arc, RwLock},
 };
-use orbclient::EventOption;
+use orbclient::{EventOption, Renderer};
 use raw_window_handle::{
-    OrbitalDisplayHandle, RawDisplayHandle, RawWindowHandle,
+    OrbitalDisplayHandle, OrbitalWindowHandle, RawDisplayHandle, RawWindowHandle,
 };
 
 use crate::{
@@ -442,7 +442,7 @@ impl Window {
         attrs: window::WindowAttributes,
         _: PlatformSpecificWindowBuilderAttributes,
     ) -> Result<Self, error::OsError> {
-        let scale = 1.0; // TODO
+        let scale = MonitorHandle.scale_factor();
 
         let (x, y) = if let Some(pos) = attrs.position {
             pos.to_physical::<i32>(scale).into()
@@ -523,33 +523,37 @@ impl Window {
         MonitorHandle.scale_factor()
     }
 
-    pub fn request_redraw(&self) {
-        //TODO *INTERNAL_EVENT.write().unwrap() = Some(InternalEvent::RedrawRequested);
-        //TODO ForeignLooper::for_thread().unwrap().wake();
-    }
+    pub fn request_redraw(&self) {}
 
     pub fn inner_position(&self) -> Result<PhysicalPosition<i32>, error::NotSupportedError> {
-        Err(error::NotSupportedError::new())
+        let window = self.inner.read().unwrap();
+        Ok((window.x(), window.y()).into())
     }
 
     pub fn outer_position(&self) -> Result<PhysicalPosition<i32>, error::NotSupportedError> {
-        Err(error::NotSupportedError::new())
+        //TODO: adjust for window decorations
+        self.inner_position()
     }
 
-    pub fn set_outer_position(&self, _position: Position) {
-        // no effect
+    pub fn set_outer_position(&self, position: Position) {
+        //TODO: adjust for window decorations
+        let (x, y) = position.to_physical::<i32>(self.scale_factor()).into();
+        self.inner.write().unwrap().set_pos(x, y);
     }
 
     pub fn inner_size(&self) -> PhysicalSize<u32> {
-        self.outer_size()
+        let window = self.inner.read().unwrap();
+        (window.width(), window.height()).into()
     }
 
-    pub fn set_inner_size(&self, _size: Size) {
-        warn!("Cannot set window size on Redox");
+    pub fn set_inner_size(&self, size: Size) {
+        let (w, h) = size.to_physical::<u32>(self.scale_factor()).into();
+        self.inner.write().unwrap().set_size(w, h);
     }
 
     pub fn outer_size(&self) -> PhysicalSize<u32> {
-        MonitorHandle.size()
+        //TODO: adjust for window decorations
+        self.inner_size()
     }
 
     pub fn set_min_inner_size(&self, _: Option<Size>) {}
@@ -633,7 +637,11 @@ impl Window {
     }
 
     pub fn raw_window_handle(&self) -> RawWindowHandle {
-        panic!("Cannot get raw window handle on Redox");
+        let mut handle = OrbitalWindowHandle::empty();
+        handle.window = &mut *self.inner.write().unwrap()
+            as *mut orbclient::Window
+            as *mut _;
+        RawWindowHandle::Orbital(handle)
     }
 
     pub fn raw_display_handle(&self) -> RawDisplayHandle {
