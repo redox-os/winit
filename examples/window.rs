@@ -14,6 +14,7 @@ fn main() {
     let window = WindowBuilder::new()
         .with_title("A fantastic window!")
         .with_inner_size(winit::dpi::LogicalSize::new(128.0, 128.0))
+        .with_resizable(true)
         .build(&event_loop)
         .unwrap();
 

@@ -21,6 +21,9 @@ mod platform;
 #[cfg(target_os = "ios")]
 #[path = "ios/mod.rs"]
 mod platform;
+#[cfg(target_os = "redox")]
+#[path = "redox/mod.rs"]
+mod platform;
 #[cfg(target_arch = "wasm32")]
 #[path = "web/mod.rs"]
 mod platform;
@@ -35,6 +38,7 @@ mod platform;
     not(target_os = "freebsd"),
     not(target_os = "netbsd"),
     not(target_os = "openbsd"),
+    not(target_os = "redox"),
     not(target_arch = "wasm32"),
 ))]
 compile_error!("The platform you're compiling for is not supported by winit");
