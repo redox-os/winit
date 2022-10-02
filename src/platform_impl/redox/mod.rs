@@ -220,7 +220,7 @@ impl<T: 'static> EventLoop<T> {
 
         loop {
             match control_flow {
-                ControlFlow::Poll => (), // TODO
+                ControlFlow::Poll => (),
                 ControlFlow::Wait => (), // TODO
                 ControlFlow::WaitUntil(instant) => (), // TODO
                 //TODO: close windows?
@@ -229,10 +229,17 @@ impl<T: 'static> EventLoop<T> {
 
             //TODO: use event queue to properly handle multiple windows!
             let windows = self.window_target.p.windows.read().unwrap();
-            for window_lock in windows.iter() {
-                let mut window = window_lock.write().unwrap();
+            for window in windows.iter() {
+                //TODO: get a meaningful window ID for multi-window apps
+                let window_id = window::WindowId(WindowId);
+
+                //TODO: do not always request redraw
+                event_handler(event::Event::RedrawRequested(
+                    window_id
+                ), &self.window_target, &mut control_flow);
+
                 //TODO: ensure window is set async or not as desired
-                for event in window.events() {
+                for event in window.write().unwrap().events() {
                     match event.to_option() {
                         EventOption::Key(event) => {
                             if event.scancode != 0 {
@@ -241,7 +248,7 @@ impl<T: 'static> EventLoop<T> {
                                     self.state.key(vk, event.pressed);
                                 }
                                 event_handler(event::Event::WindowEvent {
-                                    window_id: window::WindowId(WindowId),
+                                    window_id,
                                     event: event::WindowEvent::KeyboardInput {
                                         device_id: event::DeviceId(DeviceId),
                                         input: event::KeyboardInput {
@@ -257,13 +264,13 @@ impl<T: 'static> EventLoop<T> {
                         },
                         EventOption::TextInput(event) => {
                             event_handler(event::Event::WindowEvent {
-                                window_id: window::WindowId(WindowId),
+                                window_id,
                                 event: event::WindowEvent::ReceivedCharacter(event.character),
                             }, &self.window_target, &mut control_flow);
                         },
                         EventOption::Mouse(event) => {
                             event_handler(event::Event::WindowEvent {
-                                window_id: window::WindowId(WindowId),
+                                window_id,
                                 event: event::WindowEvent::CursorMoved {
                                     device_id: event::DeviceId(DeviceId),
                                     position: (event.x, event.y).into(),
@@ -274,7 +281,7 @@ impl<T: 'static> EventLoop<T> {
                         EventOption::Button(event) => {
                             while let Some((button, state)) = self.state.mouse(event.left, event.middle, event.right) {
                                 event_handler(event::Event::WindowEvent {
-                                    window_id: window::WindowId(WindowId),
+                                    window_id,
                                     event: event::WindowEvent::MouseInput {
                                         device_id: event::DeviceId(DeviceId),
                                         state,
@@ -286,7 +293,7 @@ impl<T: 'static> EventLoop<T> {
                         },
                         EventOption::Scroll(event) => {
                             event_handler(event::Event::WindowEvent {
-                                window_id: window::WindowId(WindowId),
+                                window_id,
                                 event: event::WindowEvent::MouseWheel {
                                     device_id: event::DeviceId(DeviceId),
                                     delta: event::MouseScrollDelta::LineDelta(
@@ -299,25 +306,25 @@ impl<T: 'static> EventLoop<T> {
                         },
                         EventOption::Quit(_event) => {
                             event_handler(event::Event::WindowEvent {
-                                window_id: window::WindowId(WindowId),
+                                window_id,
                                 event: event::WindowEvent::CloseRequested
                             }, &self.window_target, &mut control_flow);
                         },
                         EventOption::Focus(event) => {
                             event_handler(event::Event::WindowEvent {
-                                window_id: window::WindowId(WindowId),
+                                window_id,
                                 event: event::WindowEvent::Focused(event.focused)
                             }, &self.window_target, &mut control_flow);
                         },
                         EventOption::Move(event) => {
                             event_handler(event::Event::WindowEvent {
-                                window_id: window::WindowId(WindowId),
+                                window_id,
                                 event: event::WindowEvent::Moved((event.x, event.y).into())
                             }, &self.window_target, &mut control_flow);
                         },
                         EventOption::Resize(event) => {
                             event_handler(event::Event::WindowEvent {
-                                window_id: window::WindowId(WindowId),
+                                window_id,
                                 event: event::WindowEvent::Resized((event.width, event.height).into())
                             }, &self.window_target, &mut control_flow);
                         },
@@ -325,14 +332,14 @@ impl<T: 'static> EventLoop<T> {
                         EventOption::Hover(event) => {
                             if event.entered {
                                 event_handler(event::Event::WindowEvent {
-                                    window_id: window::WindowId(WindowId),
+                                    window_id,
                                     event: event::WindowEvent::CursorEntered {
                                         device_id: event::DeviceId(DeviceId),
                                     }
                                 }, &self.window_target, &mut control_flow);
                             } else {
                                 event_handler(event::Event::WindowEvent {
-                                    window_id: window::WindowId(WindowId),
+                                    window_id,
                                     event: event::WindowEvent::CursorLeft {
                                         device_id: event::DeviceId(DeviceId),
                                     }
