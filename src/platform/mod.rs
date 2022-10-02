@@ -18,6 +18,7 @@
 pub mod android;
 pub mod ios;
 pub mod macos;
+#[cfg(target_os = "redox")]
 pub mod redox;
 pub mod unix;
 pub mod web;
