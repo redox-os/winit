@@ -384,6 +384,10 @@ impl<T> Clone for EventLoopProxy<T> {
     }
 }
 
+unsafe impl<T> Send for EventLoopProxy<T> {}
+
+impl<T> Unpin for EventLoopProxy<T> {}
+
 pub struct EventLoopWindowTarget<T: 'static> {
     windows: RwLock<Vec<Arc<RwLock<orbclient::Window>>>>,
     _marker: std::marker::PhantomData<T>,
