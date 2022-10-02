@@ -18,6 +18,7 @@
 pub mod android;
 pub mod ios;
 pub mod macos;
+pub mod redox;
 pub mod unix;
 pub mod web;
 pub mod windows;

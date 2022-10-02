@@ -16,6 +16,7 @@ use crate::{
     event::{self, VirtualKeyCode},
     event_loop::{self, ControlFlow},
     monitor,
+    platform::redox::WindowExtRedox,
     window::{self, CursorGrabMode},
 };
 
@@ -637,15 +638,18 @@ impl Window {
     }
 
     pub fn raw_window_handle(&self) -> RawWindowHandle {
-        let mut handle = OrbitalWindowHandle::empty();
-        handle.window = &mut *self.inner.write().unwrap()
-            as *mut orbclient::Window
-            as *mut _;
-        RawWindowHandle::Orbital(handle)
+        //TODO
+        RawWindowHandle::Orbital(OrbitalWindowHandle::empty())
     }
 
     pub fn raw_display_handle(&self) -> RawDisplayHandle {
         RawDisplayHandle::Orbital(OrbitalDisplayHandle::empty())
+    }
+}
+
+impl WindowExtRedox for Window {
+    fn orbclient_window(&self) -> Arc<RwLock<orbclient::Window>> {
+        self.inner.clone()
     }
 }
 
