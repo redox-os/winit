@@ -17,7 +17,7 @@ use crate::{
     event_loop::{self, ControlFlow},
     monitor,
     platform::redox::WindowExtRedox,
-    window::{self, CursorGrabMode},
+    window::{self, CursorGrabMode, ResizeDirection},
 };
 
 fn convert_scancode(scancode: u8) -> Option<VirtualKeyCode> {
@@ -639,6 +639,12 @@ impl Window {
     pub fn set_cursor_visible(&self, _: bool) {}
 
     pub fn drag_window(&self) -> Result<(), error::ExternalError> {
+        Err(error::ExternalError::NotSupported(
+            error::NotSupportedError::new(),
+        ))
+    }
+
+    pub fn drag_resize_window(&self, _direction: ResizeDirection) -> Result<(), error::ExternalError> {
         Err(error::ExternalError::NotSupported(
             error::NotSupportedError::new(),
         ))
