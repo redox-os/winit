@@ -352,6 +352,8 @@ impl<T: 'static> EventLoop<T> {
                     }
                 }
             }
+
+            event_handler(event::Event::MainEventsCleared, &self.window_target, &mut control_flow);
         }
     }
 
