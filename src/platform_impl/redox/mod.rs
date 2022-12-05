@@ -353,6 +353,8 @@ impl<T: 'static> EventLoop<T> {
                 ), &self.window_target, &mut control_flow);
             }
 
+            event_handler(event::Event::RedrawEventsCleared, &self.window_target, &mut control_flow);
+
             let poll_timeout_opt = match control_flow {
                 ControlFlow::Poll => None,
                 ControlFlow::Wait => Some(-1),
