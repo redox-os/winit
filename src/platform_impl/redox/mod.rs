@@ -29,6 +29,13 @@ pub extern "C" fn tzset() {
     unimplemented!("tzset");
 }
 
+fn wake_now(time_file_mutex: &Mutex<File>) {
+    let mut time_file = time_file_mutex.lock().unwrap();
+    let mut time = syscall::TimeSpec::default();
+    time_file.read(&mut time).unwrap();
+    time_file.write(&time).unwrap();
+}
+
 fn convert_scancode(scancode: u8) -> Option<VirtualKeyCode> {
     match scancode {
         orbclient::K_A => Some(VirtualKeyCode::A),
@@ -193,9 +200,6 @@ impl EventState {
 pub struct EventLoop<T: 'static> {
     window_target: event_loop::EventLoopWindowTarget<T>,
     state: EventState,
-    user_events_sender: mpsc::Sender<T>,
-    user_events_receiver: mpsc::Receiver<T>,
-    time_file: Arc<Mutex<File>>,
 }
 
 #[derive(Default, Debug, Copy, Clone, PartialEq, Eq, Hash)]
@@ -215,14 +219,14 @@ impl<T: 'static> EventLoop<T> {
             window_target: event_loop::EventLoopWindowTarget {
                 p: EventLoopWindowTarget {
                     windows: RwLock::new(Vec::new()),
-                    _marker: std::marker::PhantomData,
+                    user_events_sender,
+                    user_events_receiver,
+                    redraws: Arc::new(Mutex::new(VecDeque::new())),
+                    time_file,
                 },
                 _marker: std::marker::PhantomData,
             },
             state: EventState::default(),
-            user_events_sender,
-            user_events_receiver,
-            time_file,
         }
     }
 
@@ -364,20 +368,16 @@ impl<T: 'static> EventLoop<T> {
                 }
             }
 
-            while let Ok(event) = self.user_events_receiver.try_recv() {
+            while let Ok(event) = self.window_target.p.user_events_receiver.try_recv() {
                 event_handler(event::Event::UserEvent(event), &self.window_target, &mut control_flow);
             }
 
             event_handler(event::Event::MainEventsCleared, &self.window_target, &mut control_flow);
 
-            //TODO: do not always request redraw
-            for window in self.window_target.p.windows.read().unwrap().iter() {
-                let window_id = window::WindowId(WindowId {
-                    raw: window.read().unwrap().as_raw_fd() as u64
-                });
-
+            // To avoid deadlocks the redraws lock is not held during event processing
+            while let Some(window_id) = self.window_target.p.redraws.lock().unwrap().pop_front() {
                 event_handler(event::Event::RedrawRequested(
-                    window_id
+                    window::WindowId(window_id)
                 ), &self.window_target, &mut control_flow);
             }
 
@@ -403,7 +403,7 @@ impl<T: 'static> EventLoop<T> {
                 pollfds.clear();
 
                 pollfds.push(libc::pollfd {
-                    fd: self.time_file.lock().unwrap().as_raw_fd(),
+                    fd: self.window_target.p.time_file.lock().unwrap().as_raw_fd(),
                     events: libc::POLLIN,
                     revents: 0,
                 });
@@ -450,8 +450,8 @@ impl<T: 'static> EventLoop<T> {
 
     pub fn create_proxy(&self) -> EventLoopProxy<T> {
         EventLoopProxy {
-            user_events_sender: self.user_events_sender.clone(),
-            time_file: self.time_file.clone(),
+            user_events_sender: self.window_target.p.user_events_sender.clone(),
+            time_file: self.window_target.p.time_file.clone(),
         }
     }
 }
@@ -466,12 +466,7 @@ impl<T> EventLoopProxy<T> {
         self.user_events_sender
             .send(event)
             .map_err(|mpsc::SendError(x)| event_loop::EventLoopClosed(x))?;
-        {
-            let mut time_file = self.time_file.lock().unwrap();
-            let mut time = syscall::TimeSpec::default();
-            time_file.read(&mut time).unwrap();
-            time_file.write(&time).unwrap();
-        }
+        wake_now(&self.time_file);
         Ok(())
     }
 }
@@ -491,7 +486,10 @@ impl<T> Unpin for EventLoopProxy<T> {}
 
 pub struct EventLoopWindowTarget<T: 'static> {
     windows: RwLock<Vec<Arc<RwLock<orbclient::Window>>>>,
-    _marker: std::marker::PhantomData<T>,
+    user_events_sender: mpsc::Sender<T>,
+    user_events_receiver: mpsc::Receiver<T>,
+    redraws: Arc<Mutex<VecDeque<WindowId>>>,
+    time_file: Arc<Mutex<File>>,
 }
 
 impl<T: 'static> EventLoopWindowTarget<T> {
@@ -552,7 +550,10 @@ impl DeviceId {
 pub struct PlatformSpecificWindowBuilderAttributes;
 
 pub struct Window {
+    id: WindowId,
     inner: Arc<RwLock<orbclient::Window>>,
+    redraws: Arc<Mutex<VecDeque<WindowId>>>,
+    time_file: Arc<Mutex<File>>,
 }
 
 impl Window {
@@ -609,17 +610,23 @@ impl Window {
             &flags
         ).ok_or(os_error!(OsError))?;
 
+        let id = WindowId {
+            raw: window.as_raw_fd() as u64,
+        };
+
         let inner = Arc::new(RwLock::new(window));
         el.windows.write().unwrap().push(inner.clone());
+
         Ok(Self {
-            inner
+            id,
+            inner,
+            redraws: el.redraws.clone(),
+            time_file: el.time_file.clone(),
         })
     }
 
     pub fn id(&self) -> WindowId {
-        WindowId {
-            raw: self.inner.read().unwrap().as_raw_fd() as u64,
-        }
+        self.id
     }
 
     pub fn primary_monitor(&self) -> Option<monitor::MonitorHandle> {
@@ -645,7 +652,8 @@ impl Window {
     }
 
     pub fn request_redraw(&self) {
-        warn!("request_redraw not implemented on Redox");
+        self.redraws.lock().unwrap().push_back(self.id);
+        wake_now(&self.time_file);
     }
 
     pub fn inner_position(&self) -> Result<PhysicalPosition<i32>, error::NotSupportedError> {
