@@ -366,7 +366,6 @@ impl<T: 'static> EventLoop<T> {
             };
 
             // Poll windows if needed
-            debug!("poll {:?}", poll_timeout_opt);
             if let Some(poll_timeout) = poll_timeout_opt {
                 pollfds.clear();
                 for window in self.window_target.p.windows.read().unwrap().iter() {
