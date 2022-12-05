@@ -22,6 +22,12 @@ use crate::{
     window::{self, CursorGrabMode, ResizeDirection},
 };
 
+//TODO: implement in relibc
+#[no_mangle]
+pub extern "C" fn tzset() {
+    unimplemented!();
+}
+
 fn convert_scancode(scancode: u8) -> Option<VirtualKeyCode> {
     match scancode {
         orbclient::K_A => Some(VirtualKeyCode::A),
