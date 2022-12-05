@@ -537,7 +537,9 @@ impl Window {
         MonitorHandle.scale_factor()
     }
 
-    pub fn request_redraw(&self) {}
+    pub fn request_redraw(&self) {
+        warn!("request_redraw not implemented on Redox");
+    }
 
     pub fn inner_position(&self) -> Result<PhysicalPosition<i32>, error::NotSupportedError> {
         let window = self.inner.read().unwrap();
@@ -570,87 +572,129 @@ impl Window {
         self.inner_size()
     }
 
-    pub fn set_min_inner_size(&self, _: Option<Size>) {}
+    pub fn set_min_inner_size(&self, _: Option<Size>) {
+        warn!("set_min_inner_size not implemented on Redox");
+    }
 
-    pub fn set_max_inner_size(&self, _: Option<Size>) {}
+    pub fn set_max_inner_size(&self, _: Option<Size>) {
+        warn!("set_max_inner_size not implemented on Redox");
+    }
 
-    pub fn set_title(&self, _title: &str) {}
+    pub fn set_title(&self, title: &str) {
+        self.inner.write().unwrap().set_title(title);
+    }
 
-    pub fn set_visible(&self, _visibility: bool) {}
+    pub fn set_visible(&self, _visibility: bool) {
+        warn!("set_visible not implemented on Redox");
+    }
 
     pub fn is_visible(&self) -> Option<bool> {
+        warn!("is_visible not implemented on Redox");
         None
     }
 
-    pub fn set_resizable(&self, _resizeable: bool) {}
+    pub fn set_resizable(&self, _resizeable: bool) {
+        warn!("set_resizable not implemented on Redox");
+    }
 
     pub fn is_resizable(&self) -> bool {
+        warn!("is_resizable not implemented on Redox");
         false
     }
 
-    pub fn set_minimized(&self, _minimized: bool) {}
+    pub fn set_minimized(&self, _minimized: bool) {
+        warn!("set_minimized not implemented on Redox");
+    }
 
-    pub fn set_maximized(&self, _maximized: bool) {}
+    pub fn set_maximized(&self, _maximized: bool) {
+        warn!("set_maximized not implemented on Redox");
+    }
 
     pub fn is_maximized(&self) -> bool {
+        warn!("is_maximized not implemented on Redox");
         false
     }
 
     pub fn set_fullscreen(&self, _monitor: Option<window::Fullscreen>) {
-        warn!("Cannot set fullscreen on Redox");
+        warn!("set_fullscreen not implemented on Redox");
     }
 
     pub fn fullscreen(&self) -> Option<window::Fullscreen> {
+        warn!("fullscreen not implemented on Redox");
         None
     }
 
-    pub fn set_decorations(&self, _decorations: bool) {}
+    pub fn set_decorations(&self, _decorations: bool) {
+        warn!("set_decorations not implemented on Redox");
+    }
 
     pub fn is_decorated(&self) -> bool {
+        warn!("is_decorated not implemented on Redox");
         true
     }
 
-    pub fn set_always_on_top(&self, _always_on_top: bool) {}
+    pub fn set_always_on_top(&self, _always_on_top: bool) {
+        warn!("set_always_on_top not implemented on Redox");
+    }
 
-    pub fn set_window_icon(&self, _window_icon: Option<crate::icon::Icon>) {}
+    pub fn set_window_icon(&self, _window_icon: Option<crate::icon::Icon>) {
+        warn!("set_window_icon not implemented on Redox");
+    }
 
-    pub fn set_ime_position(&self, _position: Position) {}
+    pub fn set_ime_position(&self, _position: Position) {
+        warn!("set_ime_position not implemented on Redox");
+    }
 
-    pub fn set_ime_allowed(&self, _allowed: bool) {}
+    pub fn set_ime_allowed(&self, _allowed: bool) {
+        warn!("set_ime_allowed not implemented on Redox");
+    }
 
-    pub fn focus_window(&self) {}
+    pub fn focus_window(&self) {
+        warn!("focus_window not implemented on Redox");
+    }
 
-    pub fn request_user_attention(&self, _request_type: Option<window::UserAttentionType>) {}
+    pub fn request_user_attention(&self, _request_type: Option<window::UserAttentionType>) {
+        warn!("request_user_attention not implemented on Redox");
+    }
 
-    pub fn set_cursor_icon(&self, _: window::CursorIcon) {}
+    pub fn set_cursor_icon(&self, _: window::CursorIcon) {
+        warn!("set_cursor_icon not implemented on Redox");
+    }
 
     pub fn set_cursor_position(&self, _: Position) -> Result<(), error::ExternalError> {
+        warn!("set_cursor_position not implemented on Redox");
         Err(error::ExternalError::NotSupported(
             error::NotSupportedError::new(),
         ))
     }
 
     pub fn set_cursor_grab(&self, _: CursorGrabMode) -> Result<(), error::ExternalError> {
+        warn!("set_cursor_grab not implemented on Redox");
         Err(error::ExternalError::NotSupported(
             error::NotSupportedError::new(),
         ))
     }
 
-    pub fn set_cursor_visible(&self, _: bool) {}
+    pub fn set_cursor_visible(&self, _: bool) {
+        warn!("set_cursor_visible not implemented on Redox");
+    }
 
     pub fn drag_window(&self) -> Result<(), error::ExternalError> {
+        warn!("drag_window not implemented on Redox");
         Err(error::ExternalError::NotSupported(
             error::NotSupportedError::new(),
         ))
     }
 
     pub fn drag_resize_window(&self, _direction: ResizeDirection) -> Result<(), error::ExternalError> {
+        warn!("drag_resize_window not implemented on Redox");
         Err(error::ExternalError::NotSupported(
             error::NotSupportedError::new(),
         ))
     }
 
     pub fn set_cursor_hittest(&self, _hittest: bool) -> Result<(), error::ExternalError> {
+        warn!("set_cursor_hittest not implemented on Redox");
         Err(error::ExternalError::NotSupported(
             error::NotSupportedError::new(),
         ))
