@@ -2,10 +2,10 @@
 
 use std::{
     collections::VecDeque,
-    io,
-    marker::PhantomData,
+    fs::{File, OpenOptions},
+    io::{self, Read, Write},
     os::unix::io::AsRawFd,
-    sync::{Arc, RwLock},
+    sync::{Arc, RwLock, Mutex, mpsc},
     time::Instant,
 };
 use orbclient::{EventOption, Renderer};
@@ -26,7 +26,7 @@ use crate::{
 //TODO: implement in relibc
 #[no_mangle]
 pub extern "C" fn tzset() {
-    unimplemented!();
+    unimplemented!("tzset");
 }
 
 fn convert_scancode(scancode: u8) -> Option<VirtualKeyCode> {
@@ -193,6 +193,9 @@ impl EventState {
 pub struct EventLoop<T: 'static> {
     window_target: event_loop::EventLoopWindowTarget<T>,
     state: EventState,
+    user_events_sender: mpsc::Sender<T>,
+    user_events_receiver: mpsc::Receiver<T>,
+    time_file: Arc<Mutex<File>>,
 }
 
 #[derive(Default, Debug, Copy, Clone, PartialEq, Eq, Hash)]
@@ -200,6 +203,14 @@ pub(crate) struct PlatformSpecificEventLoopAttributes {}
 
 impl<T: 'static> EventLoop<T> {
     pub(crate) fn new(_: &PlatformSpecificEventLoopAttributes) -> Self {
+        let (user_events_sender, user_events_receiver) = mpsc::channel();
+        let time_file = Arc::new(Mutex::new(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(format!("time:{}", syscall::CLOCK_MONOTONIC))
+                .unwrap()
+        ));
         Self {
             window_target: event_loop::EventLoopWindowTarget {
                 p: EventLoopWindowTarget {
@@ -209,6 +220,9 @@ impl<T: 'static> EventLoop<T> {
                 _marker: std::marker::PhantomData,
             },
             state: EventState::default(),
+            user_events_sender,
+            user_events_receiver,
+            time_file,
         }
     }
 
@@ -350,6 +364,10 @@ impl<T: 'static> EventLoop<T> {
                 }
             }
 
+            while let Ok(event) = self.user_events_receiver.try_recv() {
+                event_handler(event::Event::UserEvent(event), &self.window_target, &mut control_flow);
+            }
+
             event_handler(event::Event::MainEventsCleared, &self.window_target, &mut control_flow);
 
             //TODO: do not always request redraw
@@ -383,6 +401,13 @@ impl<T: 'static> EventLoop<T> {
             // Poll windows if needed
             if let Some(timeout) = timeout_opt {
                 pollfds.clear();
+
+                pollfds.push(libc::pollfd {
+                    fd: self.time_file.lock().unwrap().as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                });
+
                 for window in self.window_target.p.windows.read().unwrap().iter() {
                     pollfds.push(libc::pollfd {
                         fd: window.read().unwrap().as_raw_fd(),
@@ -390,9 +415,11 @@ impl<T: 'static> EventLoop<T> {
                         revents: 0,
                     });
                 }
+
                 let nevents = unsafe {
                     libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, timeout)
                 };
+
                 if nevents == -1 {
                     panic!("winit poll error: {}", io::Error::last_os_error());
                 } else if nevents == 0 {
@@ -423,25 +450,37 @@ impl<T: 'static> EventLoop<T> {
 
     pub fn create_proxy(&self) -> EventLoopProxy<T> {
         EventLoopProxy {
-            _marker: PhantomData,
+            user_events_sender: self.user_events_sender.clone(),
+            time_file: self.time_file.clone(),
         }
     }
 }
 
 pub struct EventLoopProxy<T: 'static> {
-    _marker: PhantomData<T>,
+    user_events_sender: mpsc::Sender<T>,
+    time_file: Arc<Mutex<File>>,
 }
 
 impl<T> EventLoopProxy<T> {
-    pub fn send_event(&self, _event: T) -> Result<(), event_loop::EventLoopClosed<T>> {
-        unimplemented!("EventLoopProxy::send_event");
+    pub fn send_event(&self, event: T) -> Result<(), event_loop::EventLoopClosed<T>> {
+        self.user_events_sender
+            .send(event)
+            .map_err(|mpsc::SendError(x)| event_loop::EventLoopClosed(x))?;
+        {
+            let mut time_file = self.time_file.lock().unwrap();
+            let mut time = syscall::TimeSpec::default();
+            time_file.read(&mut time).unwrap();
+            time_file.write(&time).unwrap();
+        }
+        Ok(())
     }
 }
 
 impl<T> Clone for EventLoopProxy<T> {
     fn clone(&self) -> Self {
-        EventLoopProxy {
-            _marker: PhantomData,
+        Self {
+            user_events_sender: self.user_events_sender.clone(),
+            time_file: self.time_file.clone(),
         }
     }
 }
