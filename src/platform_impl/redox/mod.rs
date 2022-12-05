@@ -2,6 +2,7 @@
 
 use std::{
     collections::VecDeque,
+    io,
     marker::PhantomData,
     os::unix::io::AsRawFd,
     sync::{Arc, RwLock},
@@ -15,7 +16,7 @@ use raw_window_handle::{
 use crate::{
     dpi::{PhysicalPosition, PhysicalSize, Position, Size},
     error,
-    event::{self, VirtualKeyCode},
+    event::{self, StartCause, VirtualKeyCode},
     event_loop::{self, ControlFlow},
     monitor,
     platform::redox::WindowExtRedox,
@@ -226,7 +227,10 @@ impl<T: 'static> EventLoop<T> {
     {
         let mut control_flow = ControlFlow::default();
         let mut pollfds = Vec::new();
+        let mut start_cause = StartCause::Init;
         loop {
+            event_handler(event::Event::NewEvents(start_cause), &self.window_target, &mut control_flow);
+
             for window in self.window_target.p.windows.read().unwrap().iter() {
                 let window_id = window::WindowId(WindowId {
                     raw: window.read().unwrap().as_raw_fd() as u64
@@ -361,11 +365,14 @@ impl<T: 'static> EventLoop<T> {
 
             event_handler(event::Event::RedrawEventsCleared, &self.window_target, &mut control_flow);
 
-            let poll_timeout_opt = match control_flow {
+            let start = Instant::now();
+            let mut requested_resume = None;
+            let timeout_opt = match control_flow {
                 ControlFlow::Poll => None,
                 ControlFlow::Wait => Some(-1),
                 ControlFlow::WaitUntil(instant) => {
-                    instant.checked_duration_since(Instant::now()).map(|duration| {
+                    requested_resume = Some(instant);
+                    instant.checked_duration_since(start).map(|duration| {
                         duration.as_millis().try_into().unwrap()
                     })
                 },
@@ -374,7 +381,7 @@ impl<T: 'static> EventLoop<T> {
             };
 
             // Poll windows if needed
-            if let Some(poll_timeout) = poll_timeout_opt {
+            if let Some(timeout) = timeout_opt {
                 pollfds.clear();
                 for window in self.window_target.p.windows.read().unwrap().iter() {
                     pollfds.push(libc::pollfd {
@@ -383,9 +390,29 @@ impl<T: 'static> EventLoop<T> {
                         revents: 0,
                     });
                 }
-                let _nevents = unsafe {
-                    libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, poll_timeout)
+                let nevents = unsafe {
+                    libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, timeout)
                 };
+                if nevents == -1 {
+                    panic!("winit poll error: {}", io::Error::last_os_error());
+                } else if nevents == 0 {
+                    start_cause = StartCause::ResumeTimeReached {
+                        start,
+                        requested_resume: requested_resume.unwrap(),
+                    };
+                } else {
+                    start_cause = StartCause::WaitCancelled {
+                        start,
+                        requested_resume,
+                    };
+                }
+            } else if requested_resume.is_some() {
+                start_cause = StartCause::ResumeTimeReached {
+                    start,
+                    requested_resume: requested_resume.unwrap(),
+                };
+            } else {
+                start_cause = StartCause::Poll;
             }
         }
     }
