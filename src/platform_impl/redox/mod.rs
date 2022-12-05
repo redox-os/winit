@@ -221,45 +221,11 @@ impl<T: 'static> EventLoop<T> {
         let mut control_flow = ControlFlow::default();
         let mut pollfds = Vec::new();
         loop {
-            let poll_timeout_opt = match control_flow {
-                ControlFlow::Poll => None,
-                ControlFlow::Wait => Some(-1),
-                ControlFlow::WaitUntil(instant) => {
-                    instant.checked_duration_since(Instant::now()).map(|duration| {
-                        debug!("{:?}", duration);
-                        duration.as_millis().try_into().unwrap()
-                    })
-                },
-                //TODO: close windows?
-                ControlFlow::ExitWithCode(code) => return code,
-            };
-
-            // Poll windows if needed
-            if let Some(poll_timeout) = poll_timeout_opt {
-                pollfds.clear();
-                for window in self.window_target.p.windows.read().unwrap().iter() {
-                    pollfds.push(libc::pollfd {
-                        fd: window.read().unwrap().as_raw_fd(),
-                        events: libc::POLLIN,
-                        revents: 0,
-                    });
-                }
-                let _nevents = unsafe {
-                    libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, poll_timeout)
-                };
-            }
-
-            //TODO: use event queue to properly handle multiple windows!
             for window in self.window_target.p.windows.read().unwrap().iter() {
-                //TODO: get a meaningful window ID for multi-window apps
-                let window_id = window::WindowId(WindowId);
+                let window_id = window::WindowId(WindowId {
+                    raw: window.read().unwrap().as_raw_fd() as u64
+                });
 
-                //TODO: do not always request redraw
-                event_handler(event::Event::RedrawRequested(
-                    window_id
-                ), &self.window_target, &mut control_flow);
-
-                //TODO: ensure window is set async or not as desired
                 for event in window.write().unwrap().events() {
                     match event.to_option() {
                         EventOption::Key(event) => {
@@ -368,13 +334,52 @@ impl<T: 'static> EventLoop<T> {
                             }
                         },
                         other => {
-                            eprintln!("Unhandled: {:?}", other);
+                            warn!("Unhandled: {:?}", other);
                         }
                     }
                 }
             }
 
             event_handler(event::Event::MainEventsCleared, &self.window_target, &mut control_flow);
+
+            //TODO: do not always request redraw
+            for window in self.window_target.p.windows.read().unwrap().iter() {
+                let window_id = window::WindowId(WindowId {
+                    raw: window.read().unwrap().as_raw_fd() as u64
+                });
+
+                event_handler(event::Event::RedrawRequested(
+                    window_id
+                ), &self.window_target, &mut control_flow);
+            }
+
+            let poll_timeout_opt = match control_flow {
+                ControlFlow::Poll => None,
+                ControlFlow::Wait => Some(-1),
+                ControlFlow::WaitUntil(instant) => {
+                    instant.checked_duration_since(Instant::now()).map(|duration| {
+                        duration.as_millis().try_into().unwrap()
+                    })
+                },
+                //TODO: close windows?
+                ControlFlow::ExitWithCode(code) => return code,
+            };
+
+            // Poll windows if needed
+            debug!("poll {:?}", poll_timeout_opt);
+            if let Some(poll_timeout) = poll_timeout_opt {
+                pollfds.clear();
+                for window in self.window_target.p.windows.read().unwrap().iter() {
+                    pollfds.push(libc::pollfd {
+                        fd: window.read().unwrap().as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    });
+                }
+                let _nevents = unsafe {
+                    libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, poll_timeout)
+                };
+            }
         }
     }
 
@@ -435,23 +440,29 @@ impl<T: 'static> EventLoopWindowTarget<T> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct WindowId;
+pub struct WindowId {
+    raw: u64,
+}
 
 impl WindowId {
     pub const fn dummy() -> Self {
-        WindowId
+        WindowId {
+            raw: u64::max_value(),
+        }
     }
 }
 
 impl From<WindowId> for u64 {
-    fn from(_: WindowId) -> Self {
-        0
+    fn from(id: WindowId) -> Self {
+        id.raw
     }
 }
 
 impl From<u64> for WindowId {
-    fn from(_: u64) -> Self {
-        Self
+    fn from(raw: u64) -> Self {
+        Self {
+            raw
+        }
     }
 }
 
@@ -533,7 +544,9 @@ impl Window {
     }
 
     pub fn id(&self) -> WindowId {
-        WindowId
+        WindowId {
+            raw: self.inner.read().unwrap().as_raw_fd() as u64,
+        }
     }
 
     pub fn primary_monitor(&self) -> Option<monitor::MonitorHandle> {
