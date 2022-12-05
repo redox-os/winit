@@ -3,7 +3,9 @@
 use std::{
     collections::VecDeque,
     marker::PhantomData,
+    os::unix::io::AsRawFd,
     sync::{Arc, RwLock},
+    time::Instant,
 };
 use orbclient::{EventOption, Renderer};
 use raw_window_handle::{
@@ -217,19 +219,38 @@ impl<T: 'static> EventLoop<T> {
         F: FnMut(event::Event<'_, T>, &event_loop::EventLoopWindowTarget<T>, &mut ControlFlow),
     {
         let mut control_flow = ControlFlow::default();
-
+        let mut pollfds = Vec::new();
         loop {
-            match control_flow {
-                ControlFlow::Poll => (),
-                ControlFlow::Wait => (), // TODO
-                ControlFlow::WaitUntil(instant) => (), // TODO
+            let poll_timeout_opt = match control_flow {
+                ControlFlow::Poll => None,
+                ControlFlow::Wait => Some(-1),
+                ControlFlow::WaitUntil(instant) => {
+                    instant.checked_duration_since(Instant::now()).map(|duration| {
+                        debug!("{:?}", duration);
+                        duration.as_millis().try_into().unwrap()
+                    })
+                },
                 //TODO: close windows?
                 ControlFlow::ExitWithCode(code) => return code,
+            };
+
+            // Poll windows if needed
+            if let Some(poll_timeout) = poll_timeout_opt {
+                pollfds.clear();
+                for window in self.window_target.p.windows.read().unwrap().iter() {
+                    pollfds.push(libc::pollfd {
+                        fd: window.read().unwrap().as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    });
+                }
+                let _nevents = unsafe {
+                    libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, poll_timeout)
+                };
             }
 
             //TODO: use event queue to properly handle multiple windows!
-            let windows = self.window_target.p.windows.read().unwrap();
-            for window in windows.iter() {
+            for window in self.window_target.p.windows.read().unwrap().iter() {
                 //TODO: get a meaningful window ID for multi-window apps
                 let window_id = window::WindowId(WindowId);
 
@@ -473,7 +494,7 @@ impl Window {
 
         //TODO: min/max inner_size
 
-        let mut flags = vec![];
+        let mut flags = vec![orbclient::WindowFlag::Async];
 
         if attrs.resizable {
             flags.push(orbclient::WindowFlag::Resizable);
