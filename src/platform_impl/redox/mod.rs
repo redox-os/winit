@@ -275,10 +275,23 @@ impl<T: 'static> EventLoop<T> {
         ::std::process::exit(exit_code);
     }
 
-    pub fn run_return<F>(&mut self, mut event_handler: F) -> i32
+    pub fn run_return<F>(&mut self, mut event_handler_inner: F) -> i32
     where
         F: FnMut(event::Event<'_, T>, &event_loop::EventLoopWindowTarget<T>, &mut ControlFlow),
     {
+        // Wrapper for event handler function that prevents ExitWithCode from being unset
+        let mut event_handler = move |
+            event: event::Event<'_, T>,
+            window_target: &event_loop::EventLoopWindowTarget<T>,
+            control_flow: &mut ControlFlow
+        | {
+            if let ControlFlow::ExitWithCode(code) = control_flow {
+                event_handler_inner(event, window_target, &mut ControlFlow::ExitWithCode(*code));
+            } else {
+                event_handler_inner(event, window_target, control_flow);
+            }
+        };
+
         let mut control_flow = ControlFlow::default();
         let mut start_cause = StartCause::Init;
 
