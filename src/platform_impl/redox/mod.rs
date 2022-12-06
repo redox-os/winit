@@ -2,10 +2,8 @@
 
 use std::{
     collections::VecDeque,
-    fs::{File, OpenOptions},
-    io::{self, Read, Write},
     os::unix::io::AsRawFd,
-    sync::{Arc, RwLock, Mutex, mpsc},
+    sync::{Arc, RwLock, mpsc, Mutex},
     time::Instant,
 };
 use orbclient::{EventOption, Renderer};
@@ -29,11 +27,39 @@ pub extern "C" fn tzset() {
     unimplemented!("tzset");
 }
 
-fn wake_now(time_file_mutex: &Mutex<File>) {
-    let mut time_file = time_file_mutex.lock().unwrap();
-    let mut time = syscall::TimeSpec::default();
-    time_file.read(&mut time).unwrap();
-    time_file.write(&time).unwrap();
+struct RedoxSocket {
+    fd: usize,
+}
+
+impl RedoxSocket {
+    unsafe fn open(path: &str) -> syscall::Result<Self> {
+        let fd = syscall::open(path, syscall::O_RDWR | syscall::O_CLOEXEC)?;
+        Ok(Self { fd })
+    }
+
+    fn read(&self, buf: &mut [u8]) -> syscall::Result<()> {
+        let count = syscall::read(self.fd, buf)?;
+        if count == buf.len() {
+            Ok(())
+        } else {
+            Err(syscall::Error::new(syscall::EINVAL))
+        }
+    }
+
+    fn write(&self, buf: &[u8]) -> syscall::Result<()> {
+        let count = syscall::write(self.fd, buf)?;
+        if count == buf.len() {
+            Ok(())
+        } else {
+            Err(syscall::Error::new(syscall::EINVAL))
+        }
+    }
+}
+
+impl Drop for RedoxSocket {
+    fn drop(&mut self) {
+        let _ = syscall::close(self.fd);
+    }
 }
 
 fn convert_scancode(scancode: u8) -> Option<VirtualKeyCode> {
@@ -208,21 +234,31 @@ pub(crate) struct PlatformSpecificEventLoopAttributes {}
 impl<T: 'static> EventLoop<T> {
     pub(crate) fn new(_: &PlatformSpecificEventLoopAttributes) -> Self {
         let (user_events_sender, user_events_receiver) = mpsc::channel();
-        let time_file = Arc::new(Mutex::new(
-            OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(format!("time:{}", syscall::CLOCK_MONOTONIC))
-                .unwrap()
-        ));
+
+        let event_socket = Arc::new(unsafe {
+            RedoxSocket::open("event:").unwrap()
+        });
+
+        let wake_socket = Arc::new(unsafe {
+            RedoxSocket::open("time:4").unwrap()
+        });
+
+        event_socket.write(&syscall::Event {
+            id: wake_socket.fd,
+            flags: syscall::EventFlags::EVENT_READ,
+            data: wake_socket.fd,
+        }).unwrap();
+
         Self {
             window_target: event_loop::EventLoopWindowTarget {
                 p: EventLoopWindowTarget {
-                    windows: RwLock::new(Vec::new()),
+                    windows: Mutex::new(Vec::new()),
                     user_events_sender,
                     user_events_receiver,
                     redraws: Arc::new(Mutex::new(VecDeque::new())),
-                    time_file,
+                    destroys: Arc::new(Mutex::new(VecDeque::new())),
+                    event_socket,
+                    wake_socket,
                 },
                 _marker: std::marker::PhantomData,
             },
@@ -244,17 +280,42 @@ impl<T: 'static> EventLoop<T> {
         F: FnMut(event::Event<'_, T>, &event_loop::EventLoopWindowTarget<T>, &mut ControlFlow),
     {
         let mut control_flow = ControlFlow::default();
-        let mut pollfds = Vec::new();
         let mut start_cause = StartCause::Init;
-        loop {
+
+        let code = loop {
             event_handler(event::Event::NewEvents(start_cause), &self.window_target, &mut control_flow);
 
-            for window in self.window_target.p.windows.read().unwrap().iter() {
-                let window_id = window::WindowId(WindowId {
-                    raw: window.read().unwrap().as_raw_fd() as u64
-                });
+            if start_cause == StartCause::Init {
+                event_handler(event::Event::Resumed, &self.window_target, &mut control_flow);
+            }
 
-                for event in window.write().unwrap().events() {
+            // Handle window destroys
+            while let Some(destroy_id) = self.window_target.p.destroys.lock().unwrap().pop_front() {
+                event_handler(event::Event::WindowEvent {
+                    window_id: window::WindowId(destroy_id),
+                    event: event::WindowEvent::Destroyed,
+                }, &self.window_target, &mut control_flow);
+
+                self.window_target.p.windows.lock().unwrap().retain(|(window_id, _window)| {
+                    window_id.raw != destroy_id.raw
+                });
+            }
+
+            //TODO: do window destroys here for efficiency
+            let mut i = 0;
+            loop {
+                let (window_id, event_iter) = {
+                    let mut windows = self.window_target.p.windows.lock().unwrap();
+                    match windows.get_mut(i) {
+                        Some((window_id, window)) => (
+                            *window_id,
+                            window.write().unwrap().events()
+                        ),
+                        None => break,
+                    }
+                };
+
+                for event in event_iter {
                     match event.to_option() {
                         EventOption::Key(event) => {
                             if event.scancode != 0 {
@@ -263,7 +324,7 @@ impl<T: 'static> EventLoop<T> {
                                     self.state.key(vk, event.pressed);
                                 }
                                 event_handler(event::Event::WindowEvent {
-                                    window_id,
+                                    window_id: window::WindowId(window_id),
                                     event: event::WindowEvent::KeyboardInput {
                                         device_id: event::DeviceId(DeviceId),
                                         input: event::KeyboardInput {
@@ -279,13 +340,13 @@ impl<T: 'static> EventLoop<T> {
                         },
                         EventOption::TextInput(event) => {
                             event_handler(event::Event::WindowEvent {
-                                window_id,
+                                window_id: window::WindowId(window_id),
                                 event: event::WindowEvent::ReceivedCharacter(event.character),
                             }, &self.window_target, &mut control_flow);
                         },
                         EventOption::Mouse(event) => {
                             event_handler(event::Event::WindowEvent {
-                                window_id,
+                                window_id: window::WindowId(window_id),
                                 event: event::WindowEvent::CursorMoved {
                                     device_id: event::DeviceId(DeviceId),
                                     position: (event.x, event.y).into(),
@@ -296,7 +357,7 @@ impl<T: 'static> EventLoop<T> {
                         EventOption::Button(event) => {
                             while let Some((button, state)) = self.state.mouse(event.left, event.middle, event.right) {
                                 event_handler(event::Event::WindowEvent {
-                                    window_id,
+                                    window_id: window::WindowId(window_id),
                                     event: event::WindowEvent::MouseInput {
                                         device_id: event::DeviceId(DeviceId),
                                         state,
@@ -308,7 +369,7 @@ impl<T: 'static> EventLoop<T> {
                         },
                         EventOption::Scroll(event) => {
                             event_handler(event::Event::WindowEvent {
-                                window_id,
+                                window_id: window::WindowId(window_id),
                                 event: event::WindowEvent::MouseWheel {
                                     device_id: event::DeviceId(DeviceId),
                                     delta: event::MouseScrollDelta::LineDelta(
@@ -321,25 +382,25 @@ impl<T: 'static> EventLoop<T> {
                         },
                         EventOption::Quit(_event) => {
                             event_handler(event::Event::WindowEvent {
-                                window_id,
+                                window_id: window::WindowId(window_id),
                                 event: event::WindowEvent::CloseRequested
                             }, &self.window_target, &mut control_flow);
                         },
                         EventOption::Focus(event) => {
                             event_handler(event::Event::WindowEvent {
-                                window_id,
+                                window_id: window::WindowId(window_id),
                                 event: event::WindowEvent::Focused(event.focused)
                             }, &self.window_target, &mut control_flow);
                         },
                         EventOption::Move(event) => {
                             event_handler(event::Event::WindowEvent {
-                                window_id,
+                                window_id: window::WindowId(window_id),
                                 event: event::WindowEvent::Moved((event.x, event.y).into())
                             }, &self.window_target, &mut control_flow);
                         },
                         EventOption::Resize(event) => {
                             event_handler(event::Event::WindowEvent {
-                                window_id,
+                                window_id: window::WindowId(window_id),
                                 event: event::WindowEvent::Resized((event.width, event.height).into())
                             }, &self.window_target, &mut control_flow);
                         },
@@ -347,14 +408,14 @@ impl<T: 'static> EventLoop<T> {
                         EventOption::Hover(event) => {
                             if event.entered {
                                 event_handler(event::Event::WindowEvent {
-                                    window_id,
+                                    window_id: window::WindowId(window_id),
                                     event: event::WindowEvent::CursorEntered {
                                         device_id: event::DeviceId(DeviceId),
                                     }
                                 }, &self.window_target, &mut control_flow);
                             } else {
                                 event_handler(event::Event::WindowEvent {
-                                    window_id,
+                                    window_id: window::WindowId(window_id),
                                     event: event::WindowEvent::CursorLeft {
                                         device_id: event::DeviceId(DeviceId),
                                     }
@@ -366,6 +427,8 @@ impl<T: 'static> EventLoop<T> {
                         }
                     }
                 }
+
+                i += 1;
             }
 
             while let Ok(event) = self.window_target.p.user_events_receiver.try_recv() {
@@ -383,65 +446,89 @@ impl<T: 'static> EventLoop<T> {
 
             event_handler(event::Event::RedrawEventsCleared, &self.window_target, &mut control_flow);
 
-            let start = Instant::now();
             let mut requested_resume = None;
-            let timeout_opt = match control_flow {
-                ControlFlow::Poll => None,
-                ControlFlow::Wait => Some(-1),
+            let wait = match control_flow {
+                ControlFlow::Poll => false,
+                ControlFlow::Wait => true,
                 ControlFlow::WaitUntil(instant) => {
                     requested_resume = Some(instant);
-                    instant.checked_duration_since(start).map(|duration| {
-                        duration.as_millis().try_into().unwrap()
-                    })
+                    true
                 },
                 //TODO: close windows?
-                ControlFlow::ExitWithCode(code) => return code,
+                ControlFlow::ExitWithCode(code) => break code,
             };
 
-            // Poll windows if needed
-            if let Some(timeout) = timeout_opt {
-                pollfds.clear();
-
-                pollfds.push(libc::pollfd {
-                    fd: self.window_target.p.time_file.lock().unwrap().as_raw_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                });
-
-                for window in self.window_target.p.windows.read().unwrap().iter() {
-                    pollfds.push(libc::pollfd {
-                        fd: window.read().unwrap().as_raw_fd(),
-                        events: libc::POLLIN,
-                        revents: 0,
-                    });
-                }
-
-                let nevents = unsafe {
-                    libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, timeout)
+            if wait {
+                //TODO: could we re-use wake socket?
+                // Re-using wake socket caused extra wake events before because there were leftover
+                // timeouts, and then new timeouts were added each time a spurious timeout expired
+                let timeout_socket = unsafe {
+                    RedoxSocket::open("time:4").unwrap()
                 };
 
-                if nevents == -1 {
-                    panic!("winit poll error: {}", io::Error::last_os_error());
-                } else if nevents == 0 {
-                    start_cause = StartCause::ResumeTimeReached {
-                        start,
-                        requested_resume: requested_resume.unwrap(),
-                    };
+                self.window_target.p.event_socket.write(&syscall::Event {
+                    id: timeout_socket.fd,
+                    flags: syscall::EventFlags::EVENT_READ,
+                    data: 0,
+                }).unwrap();
+
+                let start = Instant::now();
+                if let Some(instant) = requested_resume {
+                    let mut time = syscall::TimeSpec::default();
+                    timeout_socket.read(&mut time).unwrap();
+
+                    match instant.checked_duration_since(start) {
+                        Some(duration) => {
+                            time.tv_sec += duration.as_secs() as i64;
+                            time.tv_nsec += duration.subsec_nanos() as i32;
+                            while time.tv_nsec >= 1_000_000_000 {
+                                time.tv_sec += 1;
+                                time.tv_nsec -= 1_000_000_000;
+                            }
+                        },
+                        None => (),
+                    }
+
+                    //TODO: can we just write the instant directly?
+                    timeout_socket.write(&time).unwrap();
+                }
+
+                // Wait for event if needed
+                let mut event = syscall::Event::default();
+                self.window_target.p.event_socket.read(&mut event).unwrap();
+
+                if event.id == timeout_socket.fd {
+                    // If the event is from the special timeout socket, report that resume time
+                    // was reached
+                    match requested_resume {
+                        Some(requested_resume) => {
+                            start_cause = StartCause::ResumeTimeReached {
+                                start,
+                                requested_resume,
+                            };
+                        },
+                        None => {
+                            warn!("unexpected timeout {:?}", event);
+                            start_cause = StartCause::WaitCancelled {
+                                start,
+                                requested_resume,
+                            };
+                        },
+                    }
                 } else {
                     start_cause = StartCause::WaitCancelled {
                         start,
                         requested_resume,
                     };
                 }
-            } else if requested_resume.is_some() {
-                start_cause = StartCause::ResumeTimeReached {
-                    start,
-                    requested_resume: requested_resume.unwrap(),
-                };
             } else {
                 start_cause = StartCause::Poll;
             }
-        }
+        };
+
+        event_handler(event::Event::LoopDestroyed, &self.window_target, &mut control_flow);
+
+        code
     }
 
     pub fn window_target(&self) -> &event_loop::EventLoopWindowTarget<T> {
@@ -451,14 +538,14 @@ impl<T: 'static> EventLoop<T> {
     pub fn create_proxy(&self) -> EventLoopProxy<T> {
         EventLoopProxy {
             user_events_sender: self.window_target.p.user_events_sender.clone(),
-            time_file: self.window_target.p.time_file.clone(),
+            wake_socket: self.window_target.p.wake_socket.clone(),
         }
     }
 }
 
 pub struct EventLoopProxy<T: 'static> {
     user_events_sender: mpsc::Sender<T>,
-    time_file: Arc<Mutex<File>>,
+    wake_socket: Arc<RedoxSocket>,
 }
 
 impl<T> EventLoopProxy<T> {
@@ -466,7 +553,10 @@ impl<T> EventLoopProxy<T> {
         self.user_events_sender
             .send(event)
             .map_err(|mpsc::SendError(x)| event_loop::EventLoopClosed(x))?;
-        wake_now(&self.time_file);
+
+        // Writing a default TimeSpec will always trigger a time event
+        self.wake_socket.write(&syscall::TimeSpec::default()).unwrap();
+
         Ok(())
     }
 }
@@ -475,7 +565,7 @@ impl<T> Clone for EventLoopProxy<T> {
     fn clone(&self) -> Self {
         Self {
             user_events_sender: self.user_events_sender.clone(),
-            time_file: self.time_file.clone(),
+            wake_socket: self.wake_socket.clone(),
         }
     }
 }
@@ -485,11 +575,13 @@ unsafe impl<T> Send for EventLoopProxy<T> {}
 impl<T> Unpin for EventLoopProxy<T> {}
 
 pub struct EventLoopWindowTarget<T: 'static> {
-    windows: RwLock<Vec<Arc<RwLock<orbclient::Window>>>>,
+    windows: Mutex<Vec<(WindowId, Arc<RwLock<orbclient::Window>>)>>,
     user_events_sender: mpsc::Sender<T>,
     user_events_receiver: mpsc::Receiver<T>,
     redraws: Arc<Mutex<VecDeque<WindowId>>>,
-    time_file: Arc<Mutex<File>>,
+    destroys: Arc<Mutex<VecDeque<WindowId>>>,
+    event_socket: Arc<RedoxSocket>,
+    wake_socket: Arc<RedoxSocket>,
 }
 
 impl<T: 'static> EventLoopWindowTarget<T> {
@@ -553,7 +645,8 @@ pub struct Window {
     id: WindowId,
     inner: Arc<RwLock<orbclient::Window>>,
     redraws: Arc<Mutex<VecDeque<WindowId>>>,
-    time_file: Arc<Mutex<File>>,
+    destroys: Arc<Mutex<VecDeque<WindowId>>>,
+    wake_socket: Arc<RedoxSocket>,
 }
 
 impl Window {
@@ -610,18 +703,32 @@ impl Window {
             &flags
         ).ok_or(os_error!(OsError))?;
 
+        let window_fd = window.as_raw_fd() as usize;
+
+        el.event_socket.write(&syscall::Event {
+            id: window_fd,
+            flags: syscall::EventFlags::EVENT_READ,
+            data: window_fd,
+        }).unwrap();
+
         let id = WindowId {
-            raw: window.as_raw_fd() as u64,
+            raw: window_fd as u64,
         };
 
         let inner = Arc::new(RwLock::new(window));
-        el.windows.write().unwrap().push(inner.clone());
+        eprintln!("push window {} start", id.raw);
+        el.windows.lock().unwrap().push((id, inner.clone()));
+        eprintln!("push window {} finish", id.raw);
+
+        // Writing a default TimeSpec will always trigger a time event
+        el.wake_socket.write(&syscall::TimeSpec::default()).unwrap();
 
         Ok(Self {
             id,
             inner,
             redraws: el.redraws.clone(),
-            time_file: el.time_file.clone(),
+            destroys: el.destroys.clone(),
+            wake_socket: el.wake_socket.clone(),
         })
     }
 
@@ -653,7 +760,9 @@ impl Window {
 
     pub fn request_redraw(&self) {
         self.redraws.lock().unwrap().push_back(self.id);
-        wake_now(&self.time_file);
+
+        // Writing a default TimeSpec will always trigger a time event
+        self.wake_socket.write(&syscall::TimeSpec::default()).unwrap();
     }
 
     pub fn inner_position(&self) -> Result<PhysicalPosition<i32>, error::NotSupportedError> {
@@ -828,6 +937,15 @@ impl Window {
 impl WindowExtRedox for Window {
     fn orbclient_window(&self) -> Arc<RwLock<orbclient::Window>> {
         self.inner.clone()
+    }
+}
+
+impl Drop for Window {
+    fn drop(&mut self) {
+        self.destroys.lock().unwrap().push_back(self.id);
+
+        // Writing a default TimeSpec will always trigger a time event
+        self.wake_socket.write(&syscall::TimeSpec::default()).unwrap();
     }
 }
 
