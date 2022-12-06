@@ -729,9 +729,7 @@ impl Window {
         };
 
         let inner = Arc::new(RwLock::new(window));
-        eprintln!("push window {} start", id.raw);
         el.windows.lock().unwrap().push((id, inner.clone()));
-        eprintln!("push window {} finish", id.raw);
 
         // Writing a default TimeSpec will always trigger a time event
         el.wake_socket.write(&syscall::TimeSpec::default()).unwrap();
