@@ -2,11 +2,13 @@
 
 use std::{
     collections::VecDeque,
-    os::unix::io::AsRawFd,
-    sync::{Arc, RwLock, mpsc, Mutex},
+    mem,
+    slice,
+    str,
+    sync::{Arc, mpsc, Mutex, RwLock},
     time::Instant,
 };
-use orbclient::{EventOption, Renderer};
+use orbclient::EventOption;
 use raw_window_handle::{
     OrbitalDisplayHandle, OrbitalWindowHandle, RawDisplayHandle, RawWindowHandle,
 };
@@ -17,7 +19,6 @@ use crate::{
     event::{self, StartCause, VirtualKeyCode},
     event_loop::{self, ControlFlow},
     monitor,
-    platform::redox::WindowExtRedox,
     window::{self, CursorGrabMode, ResizeDirection},
 };
 
@@ -26,6 +27,12 @@ use crate::{
 pub extern "C" fn tzset() {
     unimplemented!("tzset");
 }
+
+const ORBITAL_FLAG_ASYNC: char = 'a';
+const ORBITAL_FLAG_FRONT: char = 'f';
+const ORBITAL_FLAG_BORDERLESS: char = 'l';
+const ORBITAL_FLAG_RESIZABLE: char = 'r';
+const ORBITAL_FLAG_TRANSPARENT: char = 't';
 
 struct RedoxSocket {
     fd: usize,
@@ -53,6 +60,13 @@ impl RedoxSocket {
         } else {
             Err(syscall::Error::new(syscall::EINVAL))
         }
+    }
+
+    fn fpath<'a>(&self, buf: &'a mut [u8]) -> syscall::Result<&'a str> {
+        let count = syscall::fpath(self.fd, buf)?;
+        str::from_utf8(&buf[..count]).map_err(|_err| {
+            syscall::Error::new(syscall::EINVAL)
+        })
     }
 }
 
@@ -252,7 +266,7 @@ impl<T: 'static> EventLoop<T> {
         Self {
             window_target: event_loop::EventLoopWindowTarget {
                 p: EventLoopWindowTarget {
-                    windows: Mutex::new(Vec::new()),
+                    windows: RwLock::new(Vec::new()),
                     user_events_sender,
                     user_events_receiver,
                     redraws: Arc::new(Mutex::new(VecDeque::new())),
@@ -309,26 +323,38 @@ impl<T: 'static> EventLoop<T> {
                     event: event::WindowEvent::Destroyed,
                 }, &self.window_target, &mut control_flow);
 
-                self.window_target.p.windows.lock().unwrap().retain(|(window_id, _window)| {
-                    window_id.fd != destroy_id.fd
+                self.window_target.p.windows.write().unwrap().retain(|window_socket| {
+                    window_socket.fd as u64 != destroy_id.fd
                 });
             }
 
             //TODO: do window destroys here for efficiency
             let mut i = 0;
+            let mut resize_opt = None;
             loop {
-                let (window_id, event_iter) = {
-                    let mut windows = self.window_target.p.windows.lock().unwrap();
-                    match windows.get_mut(i) {
-                        Some((window_id, window)) => (
-                            *window_id,
-                            window.write().unwrap().events()
-                        ),
+                let window = {
+                    let windows = self.window_target.p.windows.read().unwrap();
+                    match windows.get(i) {
+                        Some(window) => window.clone(),
                         None => break,
                     }
                 };
 
-                for event in event_iter {
+                let window_id = WindowId {
+                    fd: window.fd as u64,
+                };
+
+                let mut event_buf = [0u8; 16 * mem::size_of::<orbclient::Event>()];
+                let count = syscall::read(window.fd, &mut event_buf)
+                    .expect("failed to read window events");
+                let events = unsafe {
+                    slice::from_raw_parts(
+                        event_buf.as_ptr() as *const orbclient::Event,
+                        count / mem::size_of::<orbclient::Event>()
+                    )
+                };
+
+                for event in events {
                     match event.to_option() {
                         EventOption::Key(event) => {
                             if event.scancode != 0 {
@@ -416,6 +442,9 @@ impl<T: 'static> EventLoop<T> {
                                 window_id: window::WindowId(window_id),
                                 event: event::WindowEvent::Resized((event.width, event.height).into())
                             }, &self.window_target, &mut control_flow);
+
+                            // Acknowledge resize after event loop
+                            resize_opt = Some((event.width, event.height));
                         },
                         //TODO: Clipboard
                         EventOption::Hover(event) => {
@@ -441,6 +470,24 @@ impl<T: 'static> EventLoop<T> {
                     }
                 }
 
+                if count == event_buf.len() {
+                    // If event buf was full, process same window again to ensure all events are drained
+                    continue;
+                }
+
+                // Acknowledge the latest resize event
+                if let Some((w, h)) = resize_opt.take() {
+                    window.write(&format!("S,{},{}", w, h).as_bytes())
+                        .expect("failed to acknowledge resize");
+
+                    // Require redraw after resize
+                    let mut redraws = self.window_target.p.redraws.lock().unwrap();
+                    if !redraws.contains(&window_id) {
+                        redraws.push_back(window_id);
+                    }
+                }
+
+                // Move to next window
                 i += 1;
             }
 
@@ -588,7 +635,7 @@ unsafe impl<T> Send for EventLoopProxy<T> {}
 impl<T> Unpin for EventLoopProxy<T> {}
 
 pub struct EventLoopWindowTarget<T: 'static> {
-    windows: Mutex<Vec<(WindowId, Arc<RwLock<orbclient::Window>>)>>,
+    windows: RwLock<Vec<Arc<RedoxSocket>>>,
     user_events_sender: mpsc::Sender<T>,
     user_events_receiver: mpsc::Receiver<T>,
     redraws: Arc<Mutex<VecDeque<WindowId>>>,
@@ -654,9 +701,38 @@ impl DeviceId {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PlatformSpecificWindowBuilderAttributes;
 
+struct WindowProperties<'a> {
+    flags: &'a str,
+    x: i32,
+    y: i32,
+    w: u32,
+    h: u32,
+    title: &'a str,
+}
+
+impl<'a> WindowProperties<'a> {
+    fn new(path: &'a str) -> Self {
+        // orbital:/x/y/w/h/t
+        let mut parts = path.split('/');
+        let flags = parts.next().unwrap_or("");
+        let x = parts.next().map_or(0, |part| part.parse::<i32>().unwrap_or(0));
+        let y = parts.next().map_or(0, |part| part.parse::<i32>().unwrap_or(0));
+        let w = parts.next().map_or(0, |part| part.parse::<u32>().unwrap_or(0));
+        let h = parts.next().map_or(0, |part| part.parse::<u32>().unwrap_or(0));
+        let title = parts.next().unwrap_or("");
+        Self {
+            flags,
+            x,
+            y,
+            w,
+            h,
+            title
+        }
+    }
+}
+
 pub struct Window {
-    id: WindowId,
-    inner: Arc<RwLock<orbclient::Window>>,
+    window_socket: Arc<RedoxSocket>,
     redraws: Arc<Mutex<VecDeque<WindowId>>>,
     destroys: Arc<Mutex<VecDeque<WindowId>>>,
     wake_socket: Arc<RedoxSocket>,
@@ -685,58 +761,52 @@ impl Window {
 
         //TODO: min/max inner_size
 
-        let mut flags = vec![orbclient::WindowFlag::Async];
+        // Async by default
+        let mut flag_str = ORBITAL_FLAG_ASYNC.to_string();
 
         if attrs.resizable {
-            flags.push(orbclient::WindowFlag::Resizable);
+            flag_str.push(ORBITAL_FLAG_RESIZABLE);
         }
 
         //TODO: maximized, fullscreen, visible
 
         if attrs.transparent {
-            flags.push(orbclient::WindowFlag::Transparent);
+            flag_str.push(ORBITAL_FLAG_TRANSPARENT);
         }
 
         if ! attrs.decorations {
-            flags.push(orbclient::WindowFlag::Borderless);
+            flag_str.push(ORBITAL_FLAG_BORDERLESS);
         }
 
         if attrs.always_on_top {
-            flags.push(orbclient::WindowFlag::Front);
+            flag_str.push(ORBITAL_FLAG_FRONT);
         }
 
         //TODO: window_icon
 
-        let window = orbclient::Window::new_flags(
-            x,
-            y,
-            w,
-            h,
-            &attrs.title,
-            &flags
-        ).ok_or(os_error!(OsError))?;
-
-        let window_fd = window.as_raw_fd() as usize;
-
-        el.event_socket.write(&syscall::Event {
-            id: window_fd,
-            flags: syscall::EventFlags::EVENT_READ,
-            data: window_fd,
-        }).unwrap();
-
-        let id = WindowId {
-            fd: window_fd as u64,
+        // Open window
+        let window = unsafe {
+            RedoxSocket::open(&format!(
+                "orbital:{}/{}/{}/{}/{}/{}",
+                flag_str, x, y, w, h, attrs.title
+            )).expect("failed to open window")
         };
 
-        let inner = Arc::new(RwLock::new(window));
-        el.windows.lock().unwrap().push((id, inner.clone()));
+        // Add to event socket
+        el.event_socket.write(&syscall::Event {
+            id: window.fd,
+            flags: syscall::EventFlags::EVENT_READ,
+            data: window.fd,
+        }).unwrap();
+
+        let window_socket = Arc::new(window);
+        el.windows.write().unwrap().push(window_socket.clone());
 
         // Writing a default TimeSpec will always trigger a time event
         el.wake_socket.write(&syscall::TimeSpec::default()).unwrap();
 
         Ok(Self {
-            id,
-            inner,
+            window_socket,
             redraws: el.redraws.clone(),
             destroys: el.destroys.clone(),
             wake_socket: el.wake_socket.clone(),
@@ -744,7 +814,9 @@ impl Window {
     }
 
     pub fn id(&self) -> WindowId {
-        self.id
+        WindowId {
+            fd: self.window_socket.fd as u64,
+        }
     }
 
     pub fn primary_monitor(&self) -> Option<monitor::MonitorHandle> {
@@ -770,15 +842,18 @@ impl Window {
     }
 
     pub fn request_redraw(&self) {
-        self.redraws.lock().unwrap().push_back(self.id);
+        self.redraws.lock().unwrap().push_back(self.id());
 
         // Writing a default TimeSpec will always trigger a time event
         self.wake_socket.write(&syscall::TimeSpec::default()).unwrap();
     }
 
     pub fn inner_position(&self) -> Result<PhysicalPosition<i32>, error::NotSupportedError> {
-        let window = self.inner.read().unwrap();
-        Ok((window.x(), window.y()).into())
+        let mut buf: [u8; 4096] = [0; 4096];
+        let path = self.window_socket.fpath(&mut buf)
+            .expect("failed to read properties");
+        let properties = WindowProperties::new(path);
+        Ok((properties.x, properties.y).into())
     }
 
     pub fn outer_position(&self) -> Result<PhysicalPosition<i32>, error::NotSupportedError> {
@@ -788,18 +863,23 @@ impl Window {
 
     pub fn set_outer_position(&self, position: Position) {
         //TODO: adjust for window decorations
-        let (x, y) = position.to_physical::<i32>(self.scale_factor()).into();
-        self.inner.write().unwrap().set_pos(x, y);
+        let (x, y): (i32, i32) = position.to_physical::<i32>(self.scale_factor()).into();
+        self.window_socket.write(&format!("P,{},{}", x, y).as_bytes())
+            .expect("failed to set position");
     }
 
     pub fn inner_size(&self) -> PhysicalSize<u32> {
-        let window = self.inner.read().unwrap();
-        (window.width(), window.height()).into()
+        let mut buf: [u8; 4096] = [0; 4096];
+        let path = self.window_socket.fpath(&mut buf)
+            .expect("failed to read properties");
+        let properties = WindowProperties::new(path);
+        (properties.w, properties.h).into()
     }
 
     pub fn set_inner_size(&self, size: Size) {
-        let (w, h) = size.to_physical::<u32>(self.scale_factor()).into();
-        self.inner.write().unwrap().set_size(w, h);
+        let (w, h): (u32, u32) = size.to_physical::<u32>(self.scale_factor()).into();
+        self.window_socket.write(&format!("S,{},{}", w, h).as_bytes())
+            .expect("failed to set size");
     }
 
     pub fn outer_size(&self) -> PhysicalSize<u32> {
@@ -816,7 +896,8 @@ impl Window {
     }
 
     pub fn set_title(&self, title: &str) {
-        self.inner.write().unwrap().set_title(title);
+        self.window_socket.write(&format!("T,{}", title).as_bytes())
+            .expect("failed to set title");
     }
 
     pub fn set_visible(&self, _visibility: bool) {
@@ -833,8 +914,11 @@ impl Window {
     }
 
     pub fn is_resizable(&self) -> bool {
-        warn!("is_resizable not implemented on Redox");
-        false
+        let mut buf: [u8; 4096] = [0; 4096];
+        let path = self.window_socket.fpath(&mut buf)
+            .expect("failed to read properties");
+        let properties = WindowProperties::new(path);
+        properties.flags.contains(ORBITAL_FLAG_RESIZABLE)
     }
 
     pub fn set_minimized(&self, _minimized: bool) {
@@ -864,8 +948,11 @@ impl Window {
     }
 
     pub fn is_decorated(&self) -> bool {
-        warn!("is_decorated not implemented on Redox");
-        true
+        let mut buf: [u8; 4096] = [0; 4096];
+        let path = self.window_socket.fpath(&mut buf)
+            .expect("failed to read properties");
+        let properties = WindowProperties::new(path);
+        ! properties.flags.contains(ORBITAL_FLAG_BORDERLESS)
     }
 
     pub fn set_always_on_top(&self, _always_on_top: bool) {
@@ -937,7 +1024,7 @@ impl Window {
 
     pub fn raw_window_handle(&self) -> RawWindowHandle {
         let mut handle = OrbitalWindowHandle::empty();
-        handle.window = self.id.fd as usize as *mut _;
+        handle.window = self.window_socket.fd as *mut _;
         RawWindowHandle::Orbital(handle)
     }
 
@@ -946,15 +1033,9 @@ impl Window {
     }
 }
 
-impl WindowExtRedox for Window {
-    fn orbclient_window(&self) -> Arc<RwLock<orbclient::Window>> {
-        self.inner.clone()
-    }
-}
-
 impl Drop for Window {
     fn drop(&mut self) {
-        self.destroys.lock().unwrap().push_back(self.id);
+        self.destroys.lock().unwrap().push_back(self.id());
 
         // Writing a default TimeSpec will always trigger a time event
         self.wake_socket.write(&syscall::TimeSpec::default()).unwrap();
