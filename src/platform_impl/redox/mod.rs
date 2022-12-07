@@ -310,7 +310,7 @@ impl<T: 'static> EventLoop<T> {
                 }, &self.window_target, &mut control_flow);
 
                 self.window_target.p.windows.lock().unwrap().retain(|(window_id, _window)| {
-                    window_id.raw != destroy_id.raw
+                    window_id.fd != destroy_id.fd
                 });
             }
 
@@ -617,27 +617,27 @@ impl<T: 'static> EventLoopWindowTarget<T> {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct WindowId {
-    raw: u64,
+    fd: u64,
 }
 
 impl WindowId {
     pub const fn dummy() -> Self {
         WindowId {
-            raw: u64::max_value(),
+            fd: u64::max_value(),
         }
     }
 }
 
 impl From<WindowId> for u64 {
     fn from(id: WindowId) -> Self {
-        id.raw
+        id.fd
     }
 }
 
 impl From<u64> for WindowId {
-    fn from(raw: u64) -> Self {
+    fn from(fd: u64) -> Self {
         Self {
-            raw
+            fd
         }
     }
 }
@@ -725,7 +725,7 @@ impl Window {
         }).unwrap();
 
         let id = WindowId {
-            raw: window_fd as u64,
+            fd: window_fd as u64,
         };
 
         let inner = Arc::new(RwLock::new(window));
@@ -936,8 +936,9 @@ impl Window {
     }
 
     pub fn raw_window_handle(&self) -> RawWindowHandle {
-        //TODO
-        RawWindowHandle::Orbital(OrbitalWindowHandle::empty())
+        let mut handle = OrbitalWindowHandle::empty();
+        handle.window = self.id.fd as usize as *mut _;
+        RawWindowHandle::Orbital(handle)
     }
 
     pub fn raw_display_handle(&self) -> RawDisplayHandle {
@@ -959,6 +960,9 @@ impl Drop for Window {
         self.wake_socket.write(&syscall::TimeSpec::default()).unwrap();
     }
 }
+
+unsafe impl Send for Window {}
+unsafe impl Sync for Window {}
 
 #[derive(Default, Clone, Debug)]
 pub struct OsError;
