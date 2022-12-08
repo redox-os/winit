@@ -269,6 +269,7 @@ impl<T: 'static> EventLoop<T> {
                     windows: RwLock::new(Vec::new()),
                     user_events_sender,
                     user_events_receiver,
+                    creates: Mutex::new(VecDeque::new()),
                     redraws: Arc::new(Mutex::new(VecDeque::new())),
                     destroys: Arc::new(Mutex::new(VecDeque::new())),
                     event_socket,
@@ -316,6 +317,30 @@ impl<T: 'static> EventLoop<T> {
                 event_handler(event::Event::Resumed, &self.window_target, &mut control_flow);
             }
 
+            // Handle window creates
+            while let Some(window) = self.window_target.p.creates.lock().unwrap().pop_front() {
+                let window_id = WindowId {
+                    fd: window.fd as u64,
+                };
+
+                let mut buf: [u8; 4096] = [0; 4096];
+                let path = window.fpath(&mut buf)
+                    .expect("failed to read properties");
+                let properties = WindowProperties::new(path);
+
+                // Send resize event on create to indicate first size
+                event_handler(event::Event::WindowEvent {
+                    window_id: window::WindowId(window_id),
+                    event: event::WindowEvent::Resized((properties.w, properties.h).into()),
+                }, &self.window_target, &mut control_flow);
+
+                // Send resize event on create to indicate first position
+                event_handler(event::Event::WindowEvent {
+                    window_id: window::WindowId(window_id),
+                    event: event::WindowEvent::Moved((properties.x, properties.y).into()),
+                }, &self.window_target, &mut control_flow);
+            }
+
             // Handle window destroys
             while let Some(destroy_id) = self.window_target.p.destroys.lock().unwrap().pop_front() {
                 event_handler(event::Event::WindowEvent {
@@ -323,8 +348,8 @@ impl<T: 'static> EventLoop<T> {
                     event: event::WindowEvent::Destroyed,
                 }, &self.window_target, &mut control_flow);
 
-                self.window_target.p.windows.write().unwrap().retain(|window_socket| {
-                    window_socket.fd as u64 != destroy_id.fd
+                self.window_target.p.windows.write().unwrap().retain(|window| {
+                    window.fd as u64 != destroy_id.fd
                 });
             }
 
@@ -638,6 +663,7 @@ pub struct EventLoopWindowTarget<T: 'static> {
     windows: RwLock<Vec<Arc<RedoxSocket>>>,
     user_events_sender: mpsc::Sender<T>,
     user_events_receiver: mpsc::Receiver<T>,
+    creates: Mutex<VecDeque<Arc<RedoxSocket>>>,
     redraws: Arc<Mutex<VecDeque<WindowId>>>,
     destroys: Arc<Mutex<VecDeque<WindowId>>>,
     event_socket: Arc<RedoxSocket>,
@@ -802,6 +828,9 @@ impl Window {
         let window_socket = Arc::new(window);
         el.windows.write().unwrap().push(window_socket.clone());
 
+        // Notify event thread that this window was created, it will send some default events
+        el.creates.lock().unwrap().push_back(window_socket.clone());
+
         // Writing a default TimeSpec will always trigger a time event
         el.wake_socket.write(&syscall::TimeSpec::default()).unwrap();
 
@@ -842,10 +871,14 @@ impl Window {
     }
 
     pub fn request_redraw(&self) {
-        self.redraws.lock().unwrap().push_back(self.id());
+        let window_id = self.id();
+        let mut redraws = self.redraws.lock().unwrap();
+        if !redraws.contains(&window_id) {
+            redraws.push_back(window_id);
 
-        // Writing a default TimeSpec will always trigger a time event
-        self.wake_socket.write(&syscall::TimeSpec::default()).unwrap();
+            // Writing a default TimeSpec will always trigger a time event
+            self.wake_socket.write(&syscall::TimeSpec::default()).unwrap();
+        }
     }
 
     pub fn inner_position(&self) -> Result<PhysicalPosition<i32>, error::NotSupportedError> {
