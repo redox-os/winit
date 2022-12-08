@@ -523,10 +523,15 @@ impl<T: 'static> EventLoop<T> {
             event_handler(event::Event::MainEventsCleared, &self.window_target, &mut control_flow);
 
             // To avoid deadlocks the redraws lock is not held during event processing
-            while let Some(window_id) = self.window_target.p.redraws.lock().unwrap().pop_front() {
-                event_handler(event::Event::RedrawRequested(
-                    window::WindowId(window_id)
-                ), &self.window_target, &mut control_flow);
+            while let Some(window_id) = {
+                let mut redraws = self.window_target.p.redraws.lock().unwrap();
+                redraws.pop_front()
+            } {
+                event_handler(
+                    event::Event::RedrawRequested(window::WindowId(window_id)),
+                    &self.window_target,
+                    &mut control_flow,
+                );
             }
 
             event_handler(event::Event::RedrawEventsCleared, &self.window_target, &mut control_flow);
