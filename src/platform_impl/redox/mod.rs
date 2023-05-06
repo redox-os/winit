@@ -22,12 +22,6 @@ use crate::{
     window::{self, CursorGrabMode, ResizeDirection},
 };
 
-//TODO: implement in relibc
-#[no_mangle]
-pub extern "C" fn tzset() {
-    unimplemented!("tzset");
-}
-
 const ORBITAL_FLAG_ASYNC: char = 'a';
 const ORBITAL_FLAG_FRONT: char = 'f';
 const ORBITAL_FLAG_BORDERLESS: char = 'l';
