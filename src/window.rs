@@ -1134,8 +1134,8 @@ unsafe impl raw_window_handle_04::HasRawWindowHandle for Window {
             (RawWindowHandle::Xlib(window_handle), RawDisplayHandle::Xlib(display_handle)) => {
                 let mut handle = XlibHandle::empty();
                 handle.display = display_handle.display;
-                handle.window = window_handle.window;
-                handle.visual_id = window_handle.visual_id;
+                handle.window = window_handle.window as _;
+                handle.visual_id = window_handle.visual_id as _;
                 raw_window_handle_04::RawWindowHandle::Xlib(handle)
             },
             (RawWindowHandle::Xcb(window_handle), RawDisplayHandle::Xcb(display_handle)) => {
