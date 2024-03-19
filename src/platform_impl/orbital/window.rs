@@ -106,11 +106,7 @@ impl Window {
 
         // Add to event socket.
         el.event_socket
-            .write(&syscall::Event {
-                id: window.fd,
-                flags: syscall::EventFlags::EVENT_READ,
-                data: window.fd,
-            })
+            .subscribe(window.fd.raw(), window.fd.raw(), ::event::EventFlags::READ)
             .unwrap();
 
         let window_socket = Arc::new(window);
@@ -159,7 +155,7 @@ impl Window {
     #[inline]
     pub fn id(&self) -> WindowId {
         WindowId {
-            fd: self.window_socket.fd as u64,
+            fd: self.window_socket.fd.raw() as u64,
         }
     }
 
@@ -487,7 +483,7 @@ impl Window {
     #[inline]
     pub fn raw_window_handle_rwh_06(&self) -> Result<rwh_06::RawWindowHandle, rwh_06::HandleError> {
         let handle = rwh_06::OrbitalWindowHandle::new({
-            let window = self.window_socket.fd as *mut _;
+            let window = self.window_socket.fd.raw() as *mut _;
             std::ptr::NonNull::new(window).expect("orbital fd should never be null")
         });
         Ok(rwh_06::RawWindowHandle::Orbital(handle))

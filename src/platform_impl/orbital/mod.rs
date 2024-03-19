@@ -4,12 +4,16 @@ use std::fmt::{self, Display, Formatter};
 use std::str;
 use std::sync::Arc;
 
+use libredox::data::TimeSpec;
+use libredox::{errno, flag, Fd};
 use smol_str::SmolStr;
 
 use crate::{
     dpi::{PhysicalPosition, PhysicalSize},
     keyboard::Key,
 };
+
+use libredox::error::{Error, Result};
 
 pub(crate) use self::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy, OwnedDisplayHandle};
 mod event_loop;
@@ -18,15 +22,11 @@ pub use self::window::Window;
 mod window;
 
 struct RedoxSocket {
-    fd: usize,
+    fd: Fd,
 }
 
 impl RedoxSocket {
-    fn event() -> syscall::Result<Self> {
-        Self::open_raw("event:")
-    }
-
-    fn orbital(properties: &WindowProperties<'_>) -> syscall::Result<Self> {
+    fn orbital(properties: &WindowProperties<'_>) -> Result<Self> {
         Self::open_raw(&format!("{properties}"))
     }
 
@@ -34,64 +34,55 @@ impl RedoxSocket {
     // non-socket path is used, it could cause read and write to not function as expected. For
     // example, the seek would change in a potentially unpredictable way if either read or write
     // were called at the same time by multiple threads.
-    fn open_raw(path: &str) -> syscall::Result<Self> {
-        let fd = syscall::open(path, syscall::O_RDWR | syscall::O_CLOEXEC)?;
+    fn open_raw(path: &str) -> Result<Self> {
+        let fd = Fd::open(path, flag::O_RDWR | flag::O_CLOEXEC, 0)?;
         Ok(Self { fd })
     }
 
-    fn read(&self, buf: &mut [u8]) -> syscall::Result<()> {
-        let count = syscall::read(self.fd, buf)?;
+    fn write(&self, buf: &[u8]) -> Result<()> {
+        let count = self.fd.write(buf)?;
         if count == buf.len() {
             Ok(())
         } else {
-            Err(syscall::Error::new(syscall::EINVAL))
+            Err(Error::new(errno::EINVAL))
         }
     }
 
-    fn write(&self, buf: &[u8]) -> syscall::Result<()> {
-        let count = syscall::write(self.fd, buf)?;
-        if count == buf.len() {
-            Ok(())
-        } else {
-            Err(syscall::Error::new(syscall::EINVAL))
-        }
-    }
-
-    fn fpath<'a>(&self, buf: &'a mut [u8]) -> syscall::Result<&'a str> {
-        let count = syscall::fpath(self.fd, buf)?;
-        str::from_utf8(&buf[..count]).map_err(|_err| syscall::Error::new(syscall::EINVAL))
+    fn fpath<'a>(&self, buf: &'a mut [u8]) -> Result<&'a str> {
+        let count = self.fd.fpath(buf)?;
+        str::from_utf8(&buf[..count]).map_err(|_err| Error::new(errno::EINVAL))
     }
 }
 
-impl Drop for RedoxSocket {
-    fn drop(&mut self) {
-        let _ = syscall::close(self.fd);
-    }
-}
-
-pub struct TimeSocket(RedoxSocket);
+pub struct TimeSocket(Fd);
 
 impl TimeSocket {
-    fn open() -> syscall::Result<Self> {
-        RedoxSocket::open_raw("time:4").map(Self)
+    fn open() -> Result<Self> {
+        Fd::open("time:4", flag::O_RDWR | flag::O_CLOEXEC, 0).map(Self)
     }
 
     // Read current time.
-    fn current_time(&self) -> syscall::Result<syscall::TimeSpec> {
-        let mut timespec = syscall::TimeSpec::default();
-        self.0.read(&mut timespec)?;
-        Ok(timespec)
+    fn current_time(&self) -> Result<TimeSpec> {
+        let mut bytes = [0_u8; std::mem::size_of::<TimeSpec>()];
+        self.0.read(&mut bytes)?;
+        Ok(*libredox::data::timespec_from_bytes(&bytes))
     }
 
     // Write a timeout.
-    fn timeout(&self, timespec: &syscall::TimeSpec) -> syscall::Result<()> {
-        self.0.write(timespec)
+    fn timeout(&self, timespec: &TimeSpec) -> Result<()> {
+        let mut bytes = [0_u8; std::mem::size_of::<TimeSpec>()];
+        *libredox::data::timespec_from_mut_bytes(&mut bytes) = *timespec;
+        self.0.write(&bytes)?;
+        Ok(())
     }
 
     // Wake immediately.
-    fn wake(&self) -> syscall::Result<()> {
+    fn wake(&self) -> Result<()> {
         // Writing a default TimeSpec will always trigger a time event.
-        self.timeout(&syscall::TimeSpec::default())
+        self.timeout(&TimeSpec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        })
     }
 }
 
@@ -184,10 +175,10 @@ impl<'a> fmt::Display for WindowProperties<'a> {
 }
 
 #[derive(Clone, Debug)]
-pub struct OsError(Arc<syscall::Error>);
+pub struct OsError(Arc<Error>);
 
 impl OsError {
-    fn new(error: syscall::Error) -> Self {
+    fn new(error: Error) -> Self {
         Self(Arc::new(error))
     }
 }
