@@ -10,16 +10,15 @@ mod event_loop;
 pub use self::window::Window;
 mod window;
 
+use libredox::data::TimeSpec;
+use libredox::error::Result;
+
 struct RedoxSocket {
     fd: usize,
 }
 
 impl RedoxSocket {
-    fn event() -> syscall::Result<Self> {
-        Self::open_raw("event:")
-    }
-
-    fn orbital(properties: &WindowProperties<'_>) -> syscall::Result<Self> {
+    fn orbital(properties: &WindowProperties<'_>) -> Result<Self> {
         Self::open_raw(&format!("{properties}"))
     }
 
@@ -27,64 +26,66 @@ impl RedoxSocket {
     // non-socket path is used, it could cause read and write to not function as expected. For
     // example, the seek would change in a potentially unpredictable way if either read or write
     // were called at the same time by multiple threads.
-    fn open_raw(path: &str) -> syscall::Result<Self> {
-        let fd = syscall::open(path, syscall::O_RDWR | syscall::O_CLOEXEC)?;
+    fn open_raw(path: &str) -> Result<Self> {
+        let fd = libredox::call::open(path, libredox::flag::O_RDWR | libredox::flag::O_CLOEXEC, 0)?;
         Ok(Self { fd })
     }
 
-    fn read(&self, buf: &mut [u8]) -> syscall::Result<()> {
-        let count = syscall::read(self.fd, buf)?;
+    fn read(&self, buf: &mut [u8]) -> Result<()> {
+        let count = libredox::call::read(self.fd, buf)?;
         if count == buf.len() {
             Ok(())
         } else {
-            Err(syscall::Error::new(syscall::EINVAL))
+            Err(libredox::error::Error::new(libredox::errno::EINVAL))
         }
     }
 
-    fn write(&self, buf: &[u8]) -> syscall::Result<()> {
-        let count = syscall::write(self.fd, buf)?;
+    fn write(&self, buf: &[u8]) -> Result<()> {
+        let count = libredox::call::write(self.fd, buf)?;
         if count == buf.len() {
             Ok(())
         } else {
-            Err(syscall::Error::new(syscall::EINVAL))
+            Err(libredox::error::Error::new(libredox::errno::EINVAL))
         }
     }
 
-    fn fpath<'a>(&self, buf: &'a mut [u8]) -> syscall::Result<&'a str> {
-        let count = syscall::fpath(self.fd, buf)?;
-        str::from_utf8(&buf[..count]).map_err(|_err| syscall::Error::new(syscall::EINVAL))
+    fn fpath<'a>(&self, buf: &'a mut [u8]) -> Result<&'a str> {
+        let count = libredox::call::fpath(self.fd, buf)?;
+        str::from_utf8(&buf[..count]).map_err(|_err| libredox::error::Error::new(libredox::errno::EINVAL))
     }
 }
 
 impl Drop for RedoxSocket {
     fn drop(&mut self) {
-        let _ = syscall::close(self.fd);
+        let _ = libredox::call::close(self.fd);
     }
 }
 
 pub struct TimeSocket(RedoxSocket);
 
 impl TimeSocket {
-    fn open() -> syscall::Result<Self> {
+    fn open() -> Result<Self> {
         RedoxSocket::open_raw("time:4").map(Self)
     }
 
     // Read current time.
-    fn current_time(&self) -> syscall::Result<syscall::TimeSpec> {
-        let mut timespec = syscall::TimeSpec::default();
-        self.0.read(&mut timespec)?;
-        Ok(timespec)
+    fn current_time(&self) -> Result<TimeSpec> {
+        let mut timespec_bytes = [0_u8; std::mem::size_of::<TimeSpec>()];
+        self.0.read(&mut timespec_bytes)?;
+        Ok(*libredox::data::timespec_from_bytes(&timespec_bytes))
     }
 
     // Write a timeout.
-    fn timeout(&self, timespec: &syscall::TimeSpec) -> syscall::Result<()> {
-        self.0.write(timespec)
+    fn timeout(&self, timespec: &TimeSpec) -> Result<()> {
+        let mut timespec_bytes = [0_u8; std::mem::size_of::<TimeSpec>()];
+        *libredox::data::timespec_from_mut_bytes(&mut timespec_bytes) = *timespec;
+        self.0.write(&timespec_bytes)
     }
 
     // Wake immediately.
-    fn wake(&self) -> syscall::Result<()> {
+    fn wake(&self) -> Result<()> {
         // Writing a default TimeSpec will always trigger a time event.
-        self.timeout(&syscall::TimeSpec::default())
+        self.timeout(&TimeSpec { tv_sec: 0, tv_nsec: 0 })
     }
 }
 

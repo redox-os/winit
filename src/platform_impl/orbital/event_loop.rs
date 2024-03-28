@@ -9,6 +9,7 @@ use orbclient::{
     ButtonEvent, EventOption, FocusEvent, HoverEvent, KeyEvent, MouseEvent, MoveEvent, QuitEvent,
     ResizeEvent, ScrollEvent, TextInputEvent,
 };
+use ::event::RawEventQueue;
 use raw_window_handle::{OrbitalDisplayHandle, RawDisplayHandle};
 
 use crate::{
@@ -224,16 +225,16 @@ impl<T: 'static> EventLoop<T> {
     pub(crate) fn new(_: &PlatformSpecificEventLoopAttributes) -> Self {
         let (user_events_sender, user_events_receiver) = mpsc::channel();
 
-        let event_socket = Arc::new(RedoxSocket::event().unwrap());
+        let event_socket = Arc::new(RawEventQueue::new().unwrap());
 
         let wake_socket = Arc::new(TimeSocket::open().unwrap());
 
         event_socket
-            .write(&syscall::Event {
-                id: wake_socket.0.fd,
-                flags: syscall::EventFlags::EVENT_READ,
-                data: wake_socket.0.fd,
-            })
+            .subscribe(
+                wake_socket.0.fd,
+                wake_socket.0.fd,
+                ::event::EventFlags::READ,
+            )
             .unwrap();
 
         Self {
@@ -496,7 +497,7 @@ impl<T: 'static> EventLoop<T> {
 
                 let mut event_buf = [0u8; 16 * mem::size_of::<orbclient::Event>()];
                 let count =
-                    syscall::read(window.fd, &mut event_buf).expect("failed to read window events");
+                    libredox::call::read(window.fd, &mut event_buf).expect("failed to read window events");
                 // Safety: orbclient::Event is a packed struct designed to be transferred over a socket.
                 let events = unsafe {
                     slice::from_raw_parts(
@@ -585,11 +586,11 @@ impl<T: 'static> EventLoop<T> {
             self.window_target
                 .p
                 .event_socket
-                .write(&syscall::Event {
-                    id: timeout_socket.0.fd,
-                    flags: syscall::EventFlags::EVENT_READ,
-                    data: 0,
-                })
+                .subscribe(
+                    timeout_socket.0.fd,
+                    0,
+                    ::event::EventFlags::READ,
+                )
                 .unwrap();
 
             let start = Instant::now();
@@ -598,7 +599,7 @@ impl<T: 'static> EventLoop<T> {
 
                 if let Some(duration) = instant.checked_duration_since(start) {
                     time.tv_sec += duration.as_secs() as i64;
-                    time.tv_nsec += duration.subsec_nanos() as i32;
+                    time.tv_nsec += duration.subsec_nanos() as i64;
                     // Normalize timespec so tv_nsec is not greater than one second.
                     while time.tv_nsec >= 1_000_000_000 {
                         time.tv_sec += 1;
@@ -610,12 +611,15 @@ impl<T: 'static> EventLoop<T> {
             }
 
             // Wait for event if needed.
-            let mut event = syscall::Event::default();
-            self.window_target.p.event_socket.read(&mut event).unwrap();
+            let event = match self.window_target.p.event_socket.next_event() {
+                Ok(e) => e,
+                Err(err) if err.errno() == libredox::errno::EINTR => continue,
+                Err(other) => panic!("winit: failed to read from event queue: {other}"),
+            };
 
             // TODO: handle spurious wakeups (redraw caused wakeup but redraw already handled)
             match requested_resume {
-                Some(requested_resume) if event.id == timeout_socket.0.fd => {
+                Some(requested_resume) if event.fd == timeout_socket.0.fd => {
                     // If the event is from the special timeout socket, report that resume
                     // time was reached.
                     start_cause = StartCause::ResumeTimeReached {
@@ -688,7 +692,7 @@ pub struct EventLoopWindowTarget<T: 'static> {
     pub(super) creates: Mutex<VecDeque<Arc<RedoxSocket>>>,
     pub(super) redraws: Arc<Mutex<VecDeque<WindowId>>>,
     pub(super) destroys: Arc<Mutex<VecDeque<WindowId>>>,
-    pub(super) event_socket: Arc<RedoxSocket>,
+    pub(super) event_socket: Arc<RawEventQueue>,
     pub(super) wake_socket: Arc<TimeSocket>,
 }
 

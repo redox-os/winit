@@ -101,11 +101,11 @@ impl Window {
 
         // Add to event socket.
         el.event_socket
-            .write(&syscall::Event {
-                id: window.fd,
-                flags: syscall::EventFlags::EVENT_READ,
-                data: window.fd,
-            })
+            .subscribe(
+                window.fd, // fd
+                window.fd, // user_data
+                ::event::EventFlags::READ,
+            )
             .unwrap();
 
         let window_socket = Arc::new(window);
