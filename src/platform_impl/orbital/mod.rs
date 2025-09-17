@@ -65,7 +65,7 @@ pub struct TimeSocket(RedoxSocket);
 
 impl TimeSocket {
     fn open() -> Result<Self> {
-        RedoxSocket::open_raw("time:4").map(Self)
+        RedoxSocket::open_raw("/scheme/time/4").map(Self)
     }
 
     // Read current time.
