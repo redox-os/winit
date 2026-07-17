@@ -1,9 +1,8 @@
 use std::cell::Cell;
 use std::collections::VecDeque;
-use std::os::raw::c_long;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use std::{iter, mem, slice};
 
 use bitflags::bitflags;
@@ -11,12 +10,13 @@ use orbclient::{
     ButtonEvent, EventOption, FocusEvent, HoverEvent, KeyEvent, MouseEvent, MouseRelativeEvent,
     MoveEvent, QuitEvent, ResizeEvent, ScrollEvent, TextInputEvent,
 };
-use redox_event::{EventFlags, EventQueue};
+use redox_event::{EventFlags, EventQueue, UserData};
 use smol_str::SmolStr;
 use winit_core::application::ApplicationHandler;
 use winit_core::cursor::{CustomCursor, CustomCursorSource};
 use winit_core::error::{EventLoopError, NotSupportedError, RequestError};
 use winit_core::event::{self, Ime, Modifiers, StartCause};
+use winit_core::event_loop::pump_events::PumpStatus;
 use winit_core::event_loop::{
     ActiveEventLoop as RootActiveEventLoop, ControlFlow, DeviceEvents,
     EventLoopProxy as CoreEventLoopProxy, EventLoopProxyProvider,
@@ -30,6 +30,9 @@ use winit_core::window::{Theme, Window as CoreWindow, WindowId};
 
 use crate::window::Window;
 use crate::{RedoxSocket, TimeSocket, WindowProperties};
+
+/// timeout from redox_syscall
+const EVENT_TIMEOUT_ID: usize = usize::MAX - 2;
 
 fn convert_scancode(scancode: u8) -> (PhysicalKey, Option<NamedKey>) {
     // Key constants from https://docs.rs/orbclient/latest/orbclient/event/index.html
@@ -155,6 +158,15 @@ fn convert_scancode(scancode: u8) -> (PhysicalKey, Option<NamedKey>) {
         _ => return (PhysicalKey::Unidentified(NativeKeyCode::Unidentified), None),
     };
     (PhysicalKey::Code(key_code), named_key_opt)
+}
+
+pub fn scancode_to_physicalkey(scancode: u32) -> PhysicalKey {
+    convert_scancode(scancode.try_into().unwrap_or_default()).0
+}
+
+pub fn physicalkey_to_scancode(_physical_key: PhysicalKey) -> Option<u32> {
+    // TODO
+    None
 }
 
 fn element_state(pressed: bool) -> event::ElementState {
@@ -296,6 +308,7 @@ impl EventState {
 
 #[derive(Debug)]
 pub struct EventLoop {
+    start_cause: StartCause,
     windows: Vec<(Arc<RedoxSocket>, EventState)>,
     window_target: ActiveEventLoop,
     user_events_receiver: mpsc::Receiver<()>,
@@ -323,6 +336,7 @@ impl EventLoop {
             .map_err(|error| os_error!(format!("{error}")))?;
 
         Ok(Self {
+            start_cause: StartCause::Init,
             windows: Vec::new(),
             window_target: ActiveEventLoop {
                 control_flow: Cell::new(ControlFlow::default()),
@@ -522,183 +536,187 @@ impl EventLoop {
         &mut self,
         mut app: A,
     ) -> Result<(), EventLoopError> {
-        let mut start_cause = StartCause::Init;
-        loop {
-            app.new_events(&self.window_target, start_cause);
-
-            if start_cause == StartCause::Init {
-                app.can_create_surfaces(&self.window_target);
-            }
-
-            // Handle window creates.
-            while let Some(window) = {
-                let mut creates = self.window_target.creates.lock().unwrap();
-                creates.pop_front()
-            } {
-                let window_id = WindowId::from_raw(window.fd());
-
-                let mut buf: [u8; 4096] = [0; 4096];
-                let path = window.fpath(&mut buf).expect("failed to read properties");
-                let properties = WindowProperties::new(path);
-
-                self.windows.push((window, EventState::default()));
-
-                // Send resize event on create to indicate first size.
-                let event = event::WindowEvent::SurfaceResized((properties.w, properties.h).into());
-                app.window_event(&self.window_target, window_id, event);
-
-                // Send moved event on create to indicate first position.
-                let event = event::WindowEvent::Moved((properties.x, properties.y).into());
-                app.window_event(&self.window_target, window_id, event);
-            }
-
-            // Handle window destroys.
-            while let Some(destroy_id) = {
-                let mut destroys = self.window_target.destroys.lock().unwrap();
-                destroys.pop_front()
-            } {
-                app.window_event(&self.window_target, destroy_id, event::WindowEvent::Destroyed);
-                self.windows
-                    .retain(|(window, _event_state)| WindowId::from_raw(window.fd()) != destroy_id);
-            }
-
-            // Handle window events.
-            let mut i = 0;
-            // While loop is used here because the same window may be processed more than once.
-            while let Some((window, event_state)) = self.windows.get_mut(i) {
-                let window_id = WindowId::from_raw(window.fd());
-
-                let mut event_buf = [0u8; 16 * mem::size_of::<orbclient::Event>()];
-                let count = libredox::call::read(window.fd(), &mut event_buf)
-                    .expect("failed to read window events");
-                // Safety: orbclient::Event is a packed struct designed to be transferred over a
-                // socket.
-                let events = unsafe {
-                    slice::from_raw_parts(
-                        event_buf.as_ptr() as *const orbclient::Event,
-                        count / mem::size_of::<orbclient::Event>(),
-                    )
-                };
-
-                for orbital_event in events {
-                    Self::process_event(
-                        window_id,
-                        orbital_event.to_option(),
-                        event_state,
-                        &self.window_target,
-                        &mut app,
-                    );
-                }
-
-                if count == event_buf.len() {
-                    // If event buf was full, process same window again to ensure all events are
-                    // drained.
+        let exit = loop {
+            match self.pump_app_events(None, &mut app) {
+                PumpStatus::Exit(0) => {
+                    break Ok(());
+                },
+                PumpStatus::Exit(code) => {
+                    break Err(EventLoopError::ExitFailure(code));
+                },
+                _ => {
                     continue;
-                }
-
-                // Acknowledge the latest resize event.
-                if let Some((w, h)) = event_state.resize_opt.take() {
-                    window
-                        .write(format!("S,{w},{h}").as_bytes())
-                        .expect("failed to acknowledge resize");
-
-                    // Require redraw after resize.
-                    let mut redraws = self.window_target.redraws.lock().unwrap();
-                    if !redraws.contains(&window_id) {
-                        redraws.push_back(window_id);
-                    }
-                }
-
-                // Move to next window.
-                i += 1;
+                },
             }
+        };
 
-            while self.user_events_receiver.try_recv().is_ok() {
-                app.proxy_wake_up(&self.window_target);
-            }
+        exit
+    }
 
-            // To avoid deadlocks the redraws lock is not held during event processing.
-            while let Some(window_id) = {
-                let mut redraws = self.window_target.redraws.lock().unwrap();
-                redraws.pop_front()
-            } {
-                app.window_event(
-                    &self.window_target,
+    fn single_iteration<A: ApplicationHandler>(&mut self, app: &mut A, cause: StartCause) {
+        app.new_events(&self.window_target, cause);
+
+        if cause == StartCause::Init {
+            app.can_create_surfaces(&self.window_target);
+        }
+
+        // Handle window creates.
+        while let Some(window) = {
+            let mut creates = self.window_target.creates.lock().unwrap();
+            creates.pop_front()
+        } {
+            let window_id = WindowId::from_raw(window.fd());
+
+            let mut buf: [u8; 4096] = [0; 4096];
+            let path = window.fpath(&mut buf).expect("failed to read properties");
+            let properties = WindowProperties::new(path);
+
+            self.windows.push((window, EventState::default()));
+
+            // Send resize event on create to indicate first size.
+            let event = event::WindowEvent::SurfaceResized((properties.w, properties.h).into());
+            app.window_event(&self.window_target, window_id, event);
+
+            // Send moved event on create to indicate first position.
+            let event = event::WindowEvent::Moved((properties.x, properties.y).into());
+            app.window_event(&self.window_target, window_id, event);
+        }
+
+        // Handle window destroys.
+        while let Some(destroy_id) = {
+            let mut destroys = self.window_target.destroys.lock().unwrap();
+            destroys.pop_front()
+        } {
+            app.window_event(&self.window_target, destroy_id, event::WindowEvent::Destroyed);
+            self.windows
+                .retain(|(window, _event_state)| WindowId::from_raw(window.fd()) != destroy_id);
+        }
+
+        // Handle window events.
+        let mut i = 0;
+        // While loop is used here because the same window may be processed more than once.
+        while let Some((window, event_state)) = self.windows.get_mut(i) {
+            let window_id = WindowId::from_raw(window.fd());
+
+            let mut event_buf = [0u8; 16 * mem::size_of::<orbclient::Event>()];
+            let count = libredox::call::read(window.fd(), &mut event_buf)
+                .expect("failed to read window events");
+            // Safety: orbclient::Event is a packed struct designed to be transferred over a
+            // socket.
+            let events = unsafe {
+                slice::from_raw_parts(
+                    event_buf.as_ptr() as *const orbclient::Event,
+                    count / mem::size_of::<orbclient::Event>(),
+                )
+            };
+
+            for orbital_event in events {
+                Self::process_event(
                     window_id,
-                    event::WindowEvent::RedrawRequested,
+                    orbital_event.to_option(),
+                    event_state,
+                    &self.window_target,
+                    app,
                 );
             }
 
-            app.about_to_wait(&self.window_target);
-
-            if self.window_target.exiting() {
-                break;
+            if count == event_buf.len() {
+                // If event buf was full, process same window again to ensure all events are
+                // drained.
+                continue;
             }
 
-            let requested_resume = match self.window_target.control_flow() {
-                ControlFlow::Poll => {
-                    start_cause = StartCause::Poll;
-                    continue;
-                },
-                ControlFlow::Wait => None,
-                ControlFlow::WaitUntil(instant) => Some(instant),
-            };
+            // Acknowledge the latest resize event.
+            if let Some((w, h)) = event_state.resize_opt.take() {
+                window
+                    .write(format!("S,{w},{h}").as_bytes())
+                    .expect("failed to acknowledge resize");
 
-            // Re-using wake socket caused extra wake events before because there were leftover
-            // timeouts, and then new timeouts were added each time a spurious timeout expired.
-            let timeout_socket = TimeSocket::open().unwrap();
-
-            self.window_target
-                .event_socket
-                .subscribe(timeout_socket.0.fd(), EventSource::Time, EventFlags::READ)
-                .unwrap();
-
-            let start = Instant::now();
-            if let Some(instant) = requested_resume {
-                let mut time = timeout_socket.current_time().unwrap();
-
-                if let Some(duration) = instant.checked_duration_since(start) {
-                    time.tv_sec += duration.as_secs() as i64;
-                    time.tv_nsec += duration.subsec_nanos() as c_long;
-                    // Normalize timespec so tv_nsec is not greater than one second.
-                    while time.tv_nsec >= 1_000_000_000 {
-                        time.tv_sec += 1;
-                        time.tv_nsec -= 1_000_000_000;
-                    }
+                // Require redraw after resize.
+                let mut redraws = self.window_target.redraws.lock().unwrap();
+                if !redraws.contains(&window_id) {
+                    redraws.push_back(window_id);
                 }
-
-                timeout_socket.timeout(&time).unwrap();
             }
 
-            // Wait for event if needed.
-            let event = loop {
-                match self.window_target.event_socket.next_event() {
-                    Ok(event) => break event,
-                    Err(err) if err.is_interrupt() => continue,
-                    Err(err) => {
-                        return Err(os_error!(format!("failed to read event: {err}")).into());
-                    },
-                }
-            };
-
-            // TODO: handle spurious wakeups (redraw caused wakeup but redraw already handled)
-            match requested_resume {
-                Some(requested_resume)
-                    if event.fd == timeout_socket.0.fd()
-                        && matches!(event.user_data, EventSource::Time) =>
-                {
-                    // If the event is from the special timeout socket, report that resume
-                    // time was reached.
-                    start_cause = StartCause::ResumeTimeReached { start, requested_resume };
-                },
-                _ => {
-                    // Normal window event or spurious timeout.
-                    start_cause = StartCause::WaitCancelled { start, requested_resume };
-                },
-            }
+            // Move to next window.
+            i += 1;
         }
 
-        Ok(())
+        while self.user_events_receiver.try_recv().is_ok() {
+            app.proxy_wake_up(&self.window_target);
+        }
+
+        // To avoid deadlocks the redraws lock is not held during event processing.
+        while let Some(window_id) = {
+            let mut redraws = self.window_target.redraws.lock().unwrap();
+            redraws.pop_front()
+        } {
+            app.window_event(&self.window_target, window_id, event::WindowEvent::RedrawRequested);
+        }
+
+        app.about_to_wait(&self.window_target);
+    }
+
+    pub fn pump_app_events<A: ApplicationHandler>(
+        &mut self,
+        timeout: Option<Duration>,
+        mut app: A,
+    ) -> PumpStatus {
+        if self.start_cause == StartCause::Init {
+            // Run the initial loop iteration.
+            self.single_iteration(&mut app, self.start_cause);
+        }
+
+        if self.window_target.exit.get() {
+            // TODO: other exit codes
+            return PumpStatus::Exit(0);
+        }
+
+        let start = Instant::now();
+
+        if let Some(timeout) = timeout {
+            self.window_target
+                .event_socket
+                .subscribe(
+                    EVENT_TIMEOUT_ID,
+                    UserData::from_user_data(timeout.as_millis() as usize),
+                    EventFlags::READ,
+                )
+                .unwrap()
+        }
+
+        // Wait for event if needed.
+        let event = loop {
+            match self.window_target.event_socket.next_event() {
+                Ok(event) => break event,
+                Err(err) if err.is_interrupt() => continue,
+                Err(err) => {
+                    panic!("failed to read event: {err}");
+                },
+            }
+        };
+
+        match timeout {
+            Some(timeout) if event.fd == EVENT_TIMEOUT_ID => {
+                // If the event is from the special timeout socket, report that resume
+                // time was reached.
+                self.start_cause =
+                    StartCause::ResumeTimeReached { start, requested_resume: start + timeout };
+            },
+            timeout => {
+                // Normal window event or spurious timeout.
+                self.start_cause = StartCause::WaitCancelled {
+                    start,
+                    requested_resume: timeout.map(|t| start + t),
+                };
+
+                // Do actual event processing
+                self.single_iteration(&mut app, self.start_cause);
+            },
+        }
+
+        PumpStatus::Continue
     }
 
     pub fn window_target(&self) -> &dyn RootActiveEventLoop {
